@@ -25,6 +25,7 @@ import (
 
 	"github.com/projectcalico/calico/kube-controllers/pkg/config"
 	"github.com/projectcalico/calico/kube-controllers/pkg/controllers/controller"
+	"github.com/projectcalico/calico/kube-controllers/pkg/controllers/utils"
 	api "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 )
@@ -40,9 +41,7 @@ const (
 	hepCreatedLabelValue  = "calico-kube-controllers"
 )
 
-var (
-	retrySleepTime = 100 * time.Millisecond
-)
+var retrySleepTime = 100 * time.Millisecond
 
 // NodeController implements the Controller interface.  It is responsible for monitoring
 // kubernetes nodes and responding to delete events by removing them from the Calico datastore.
@@ -56,7 +55,7 @@ type NodeController struct {
 
 	// For accessing Calico datastore.
 	calicoClient client.Interface
-	dataFeed     *DataFeed
+	dataFeed     *utils.DataFeed
 
 	// Sub-controllers
 	ipamCtrl *ipamController
@@ -67,12 +66,13 @@ func NewNodeController(ctx context.Context,
 	k8sClientset *kubernetes.Clientset,
 	calicoClient client.Interface,
 	cfg config.NodeControllerConfig,
-	nodeInformer, podInformer cache.SharedIndexInformer) controller.Controller {
+	nodeInformer, podInformer cache.SharedIndexInformer,
+	dataFeed *utils.DataFeed) controller.Controller {
 	nc := &NodeController{
 		ctx:          ctx,
 		calicoClient: calicoClient,
 		k8sClientset: k8sClientset,
-		dataFeed:     NewDataFeed(calicoClient),
+		dataFeed:     dataFeed,
 		nodeInformer: nodeInformer,
 		podInformer:  podInformer,
 	}
@@ -102,7 +102,8 @@ func NewNodeController(ctx context.Context,
 			for _, f := range nodeDeletionFuncs {
 				f()
 			}
-		}}
+		},
+	}
 
 	// Create the Auto HostEndpoint sub-controller and register it to receive data.
 	// We always launch this controller, even if auto-HEPs are disabled, since the controller
@@ -129,9 +130,6 @@ func NewNodeController(ctx context.Context,
 		log.WithError(err).Error("failed to add event handler for node")
 		return nil
 	}
-
-	// Start the Calico data feed.
-	nc.dataFeed.Start()
 
 	return nc
 }

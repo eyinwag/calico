@@ -68,6 +68,14 @@ rules:
     verbs:
       - watch
       - list
+  # Watch for changes to Kubernetes (Baseline)AdminNetworkPolicies.
+  - apiGroups: ["policy.networking.k8s.io"]
+    resources:
+      - adminnetworkpolicies
+      - baselineadminnetworkpolicies
+    verbs:
+      - watch
+      - list
   # Used by Calico for policy information.
   - apiGroups: [""]
     resources:
@@ -103,10 +111,17 @@ rules:
       - hostendpoints
       - blockaffinities
       - caliconodestatuses
+      - tiers
     verbs:
       - get
       - list
       - watch
+   # Calico creates some tiers on startup.
+  - apiGroups: ["crd.projectcalico.org"]
+    resources:
+      - tiers
+    verbs:
+      - create
   # Calico must create and update some CRDs on startup.
   - apiGroups: ["crd.projectcalico.org"]
     resources:

@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,16 +15,16 @@
 package calc
 
 import (
+	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
-
-	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
 	"github.com/projectcalico/calico/felix/config"
 	"github.com/projectcalico/calico/felix/dispatcher"
 	"github.com/projectcalico/calico/felix/labelindex"
 	"github.com/projectcalico/calico/felix/proto"
 	"github.com/projectcalico/calico/felix/serviceindex"
+	"github.com/projectcalico/calico/felix/types"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	"github.com/projectcalico/calico/libcalico-go/lib/net"
@@ -78,9 +78,9 @@ type passthruCallbacks interface {
 	OnIPPoolUpdate(model.IPPoolKey, *model.IPPool)
 	OnIPPoolRemove(model.IPPoolKey)
 	OnServiceAccountUpdate(*proto.ServiceAccountUpdate)
-	OnServiceAccountRemove(proto.ServiceAccountID)
+	OnServiceAccountRemove(types.ServiceAccountID)
 	OnNamespaceUpdate(*proto.NamespaceUpdate)
-	OnNamespaceRemove(proto.NamespaceID)
+	OnNamespaceRemove(types.NamespaceID)
 	OnWireguardUpdate(string, *model.Wireguard)
 	OnWireguardRemove(string)
 	OnGlobalBGPConfigUpdate(*v3.BGPConfiguration)
@@ -192,18 +192,26 @@ func NewCalculationGraph(callbacks PipelineCallbacks, conf *config.Config, liveC
 	// render into the dataplane.
 	//
 	//           ...
-	//        Dispatcher (all updates)
-	//           /   \
-	//          /     \  All Host/Workload Endpoints
-	//         /       \
-	//        /      Dispatcher (local updates)
-	//       /            |
-	//       | Policies   | Local Host/Workload Endpoints only
-	//       | Profiles   |
-	//       |            |
-	//     Active Rules Calculator
-	//              |
-	//              | Locally active policies/profiles
+	//           Dispatcher (all updates)
+	//                /\        \
+	//               /  \        \  All Host/Workload Endpoints
+	//              /    \        \
+	//             /      \     Dispatcher (local updates)
+	//            /        \             |
+	//            |         \             \  Local Host/Workload
+	//            |          \             \ Endpoints only
+	//           / \          \             \
+	// Profiles /   \ Policies \             \
+	//         /     \          \             \
+	//         \      \          |             \
+	//          \      \         |Tiers        |
+	//           \      \        |             /
+	//            \      |       |            /
+	//             \     |       |           /
+	//              \    |       |          /
+	//              Active Rules Calculator
+	//                   |
+	//                   | Locally active policies/profiles
 	//             ...
 	//
 	activeRulesCalc := NewActiveRulesCalculator()
@@ -356,10 +364,10 @@ func NewCalculationGraph(callbacks PipelineCallbacks, conf *config.Config, liveC
 	//
 	polResolver := NewPolicyResolver()
 	// Hook up the inputs to the policy resolver.
-	activeRulesCalc.PolicyMatchListener = polResolver
+	activeRulesCalc.RegisterPolicyMatchListener(polResolver)
 	polResolver.RegisterWith(allUpdDispatcher, localEndpointDispatcher)
 	// And hook its output to the callbacks.
-	polResolver.Callbacks = callbacks
+	polResolver.RegisterCallback(callbacks)
 	cg.policyResolver = polResolver
 
 	// Register for host IP updates.

@@ -20,12 +20,11 @@ import (
 	"math/bits"
 	"strings"
 
-	"github.com/projectcalico/calico/felix/bpf/ipsets"
-	"github.com/projectcalico/calico/felix/bpf/maps"
-
 	log "github.com/sirupsen/logrus"
 
 	. "github.com/projectcalico/calico/felix/bpf/asm"
+	"github.com/projectcalico/calico/felix/bpf/ipsets"
+	"github.com/projectcalico/calico/felix/bpf/maps"
 	"github.com/projectcalico/calico/felix/bpf/state"
 	"github.com/projectcalico/calico/felix/ip"
 	"github.com/projectcalico/calico/felix/proto"
@@ -163,6 +162,7 @@ var (
 	// Bits in the state flags field.
 	FlagDestIsHost uint64 = 1 << 2
 	FlagSrcIsHost  uint64 = 1 << 3
+	FlagLogPacket  uint64 = 1 << 10
 )
 
 type Rule struct {
@@ -484,6 +484,7 @@ func (p *Builder) writeTiers(tiers []Tier, destLeg matchLeg, allowLabel string) 
 	actionLabels := map[string]string{
 		"allow": allowLabel,
 		"deny":  "deny",
+		"log":   "log",
 	}
 	for _, tier := range tiers {
 		endOfTierLabel := fmt.Sprint("end_of_tier_", p.tierID)
@@ -527,12 +528,12 @@ func (p *Builder) writePolicyRules(policy Policy, actionLabels map[string]string
 	for ruleIdx, rule := range policy.Rules {
 		log.Debugf("Start of rule %d", ruleIdx)
 		p.b.AddCommentF("Start of rule %s", rule)
+		ipsets := p.printIPSetIDs(rule)
+		if ipsets != "" {
+			p.b.AddCommentF("IPSets %s", p.printIPSetIDs(rule))
+		}
 		p.b.AddCommentF("Rule MatchID: %d", rule.MatchID)
 		action := strings.ToLower(rule.Action)
-		if action == "log" {
-			log.Debug("Skipping log rule.  Not supported in BPF mode.")
-			continue
-		}
 		p.writeRule(rule, actionLabels[action], destLeg)
 		log.Debugf("End of rule %d", ruleIdx)
 		p.b.AddCommentF("End of rule %s", rule.RuleId)
@@ -737,14 +738,20 @@ func (p *Builder) writeStartOfRule() {
 }
 
 func (p *Builder) writeEndOfRule(rule Rule, actionLabel string) {
-	// If all the match criteria are met, we fall through to the end of the rule
-	// so all that's left to do is to jump to the relevant action.
-	// TODO log and log-and-xxx actions
-	if p.policyDebugEnabled {
-		p.writeRecordRuleHit(rule, actionLabel)
-	}
+	if actionLabel == "log" {
+		p.b.Load64(R1, R9, stateOffFlags)
+		p.b.OrImm64(R1, int32(FlagLogPacket))
+		p.b.Store64(R9, R1, stateOffFlags)
+	} else {
+		// If all the match criteria are met, we fall through to the end of the rule
+		// so all that's left to do is to jump to the relevant action.
+		// TODO log and log-and-xxx actions
+		if p.policyDebugEnabled {
+			p.writeRecordRuleHit(rule, actionLabel)
+		}
 
-	p.b.Jump(actionLabel)
+		p.b.Jump(actionLabel)
+	}
 
 	p.b.LabelNextInsn(p.endOfRuleLabel())
 }
@@ -891,6 +898,37 @@ func (p *Builder) writeCIDRSMatch(negate bool, leg matchLeg, cidrs []string) {
 		// Label the next match so we can skip to it on success.
 		p.b.LabelNextInsn(onMatchLabel)
 	}
+}
+
+func (p *Builder) printIPSetIDs(r Rule) string {
+	str := ""
+	joinIDs := func(ipSets []string) string {
+		idString := []string{}
+		for _, ipSetID := range ipSets {
+			id := p.ipSetIDProvider.GetNoAlloc(ipSetID)
+			if id != 0 {
+				idString = append(idString, fmt.Sprintf("0x%x", id))
+			}
+		}
+		return strings.Join(idString[:], ",")
+	}
+	srcIDString := joinIDs(r.SrcIpSetIds)
+	if srcIDString != "" {
+		str = str + fmt.Sprintf("src_ip_set_ids:<%s> ", srcIDString)
+	}
+	notSrcIDString := joinIDs(r.NotSrcIpSetIds)
+	if notSrcIDString != "" {
+		str = str + fmt.Sprintf("not_src_ip_set_ids:<%s> ", notSrcIDString)
+	}
+	dstIDString := joinIDs(r.DstIpSetIds)
+	if dstIDString != "" {
+		str = str + fmt.Sprintf("dst_ip_set_ids:<%s> ", dstIDString)
+	}
+	notDstIDString := joinIDs(r.NotDstIpSetIds)
+	if notDstIDString != "" {
+		str = str + fmt.Sprintf("not_dst_ip_set_ids:<%s> ", notDstIDString)
+	}
+	return str
 }
 
 func (p *Builder) writeIPSetMatch(negate bool, leg matchLeg, ipSets []string) {
@@ -1211,12 +1249,6 @@ func WithAllowDenyJumps(allow, deny int) Option {
 	}
 }
 
-func WithIPv6() Option {
-	return func(p *Builder) {
-		p.forIPv6 = true
-	}
-}
-
 // WithPolicyMapIndexAndStride tells the builder the "shape" of the policy
 // jump map, allowing it to split the program if it gets too large.
 // entryPointIdx is the jump map key for the first "entry point" program.
@@ -1227,6 +1259,12 @@ func WithPolicyMapIndexAndStride(entryPointIdx, stride int) Option {
 	return func(b *Builder) {
 		b.policyMapIndex = entryPointIdx
 		b.policyMapStride = stride
+	}
+}
+
+func WithIPv6() Option {
+	return func(p *Builder) {
+		p.forIPv6 = true
 	}
 }
 

@@ -18,7 +18,6 @@ import (
 	"reflect"
 
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -29,7 +28,7 @@ const (
 	HostEndpointCRDName      = "hostendpoints.crd.projectcalico.org"
 )
 
-func NewHostEndpointClient(c *kubernetes.Clientset, r *rest.RESTClient) K8sResourceClient {
+func NewHostEndpointClient(c kubernetes.Interface, r rest.Interface) K8sResourceClient {
 	return &customK8sResourceClient{
 		clientSet:       c,
 		restClient:      r,

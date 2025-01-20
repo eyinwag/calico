@@ -1,6 +1,6 @@
 //go:build !windows
 
-// Copyright (c) 2021-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2024 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,8 +29,8 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	log "github.com/sirupsen/logrus"
-
 	"github.com/vishvananda/netlink"
+	googleproto "google.golang.org/protobuf/proto"
 
 	"github.com/projectcalico/calico/felix/bpf"
 	"github.com/projectcalico/calico/felix/bpf/asm"
@@ -59,6 +59,7 @@ import (
 	"github.com/projectcalico/calico/felix/proto"
 	"github.com/projectcalico/calico/felix/routetable"
 	"github.com/projectcalico/calico/felix/rules"
+	"github.com/projectcalico/calico/felix/types"
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
 )
 
@@ -115,10 +116,12 @@ func (m *mockDataplane) loadDefaultPolicies() error {
 }
 
 func (m *mockDataplane) ensureProgramAttached(ap attachPoint) (qDiscInfo, error) {
-	var qdisc qDiscInfo
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
 	key := ap.IfaceName() + ":" + ap.HookName().String()
 	m.numAttaches[key] = m.numAttaches[key] + 1
-	return qdisc, nil
+	return qDiscInfo{valid: true, prio: 49152, handle: 1}, nil
 }
 
 func (m *mockDataplane) ensureProgramLoaded(ap attachPoint, ipFamily proto.IPVersion) error {
@@ -210,6 +213,19 @@ func (m *mockDataplane) createIface(name string, index int, linkType string) err
 	iface := netlink.GenericLink{
 		LinkAttrs: attr,
 		LinkType:  linkType,
+	}
+	return m.netlinkShim.LinkAdd(&iface)
+}
+
+func (m *mockDataplane) createVlanIface(name string, index, parentIndex int) error {
+	attr := netlink.NewLinkAttrs()
+	attr.Name = name
+	attr.Index = index
+	attr.ParentIndex = parentIndex
+
+	iface := netlink.GenericLink{
+		LinkAttrs: attr,
+		LinkType:  "vlan",
 	}
 	return m.netlinkShim.LinkAdd(&iface)
 }
@@ -408,20 +424,20 @@ var _ = Describe("BPF Endpoint Manager", func() {
 		maps.CommonMaps = commonMaps
 
 		rrConfigNormal = rules.Config{
-			IPIPEnabled:                 true,
-			IPIPTunnelAddress:           nil,
-			IPSetConfigV4:               ipsets.NewIPVersionConfig(ipsets.IPFamilyV4, "cali", nil, nil),
-			IPSetConfigV6:               ipsets.NewIPVersionConfig(ipsets.IPFamilyV6, "cali", nil, nil),
-			IptablesMarkAccept:          0x8,
-			IptablesMarkPass:            0x10,
-			IptablesMarkScratch0:        0x20,
-			IptablesMarkScratch1:        0x40,
-			IptablesMarkEndpoint:        0xff00,
-			IptablesMarkNonCaliEndpoint: 0x0100,
-			KubeIPVSSupportEnabled:      true,
-			WorkloadIfacePrefixes:       []string{"cali", "tap"},
-			VXLANPort:                   4789,
-			VXLANVNI:                    4096,
+			IPIPEnabled:            true,
+			IPIPTunnelAddress:      nil,
+			IPSetConfigV4:          ipsets.NewIPVersionConfig(ipsets.IPFamilyV4, "cali", nil, nil),
+			IPSetConfigV6:          ipsets.NewIPVersionConfig(ipsets.IPFamilyV6, "cali", nil, nil),
+			MarkAccept:             0x8,
+			MarkPass:               0x10,
+			MarkScratch0:           0x20,
+			MarkScratch1:           0x40,
+			MarkEndpoint:           0xff00,
+			MarkNonCaliEndpoint:    0x0100,
+			KubeIPVSSupportEnabled: true,
+			WorkloadIfacePrefixes:  []string{"cali", "tap"},
+			VXLANPort:              4789,
+			VXLANVNI:               4096,
 		}
 		ruleRenderer = rules.NewRenderer(rrConfigNormal)
 		filterTableV4 = newMockTable("filter")
@@ -499,10 +515,10 @@ var _ = Describe("BPF Endpoint Manager", func() {
 
 	genHEPUpdate := func(heps ...interface{}) func() {
 		return func() {
-			hostIfaceToEp := make(map[string]proto.HostEndpoint)
+			hostIfaceToEp := make(map[string]*proto.HostEndpoint)
 			for i := 0; i < len(heps); i += 2 {
 				log.Infof("%v = %v", heps[i], heps[i+1])
-				hostIfaceToEp[heps[i].(string)] = heps[i+1].(proto.HostEndpoint)
+				hostIfaceToEp[heps[i].(string)] = heps[i+1].(*proto.HostEndpoint)
 			}
 			log.Infof("2 hostIfaceToEp = %v", hostIfaceToEp)
 			bpfEpMgr.OnHEPUpdate(hostIfaceToEp)
@@ -556,6 +572,21 @@ var _ = Describe("BPF Endpoint Manager", func() {
 		}
 	}
 
+	genWLUpdateEpRemove := func(name string, policies ...string) func() {
+		return func() {
+			update := &proto.WorkloadEndpointRemove{
+				Id: &proto.WorkloadEndpointID{
+					OrchestratorId: "k8s",
+					WorkloadId:     name,
+					EndpointId:     name,
+				},
+			}
+			bpfEpMgr.OnUpdate(update)
+			err := bpfEpMgr.CompleteDeferredWork()
+			Expect(err).NotTo(HaveOccurred())
+		}
+	}
+
 	genHostMetadataUpdate := func(ip string) func() {
 		return func() {
 			bpfEpMgr.OnUpdate(&proto.HostMetadataUpdate{
@@ -578,23 +609,23 @@ var _ = Describe("BPF Endpoint Manager", func() {
 		}
 	}
 
-	hostEp := proto.HostEndpoint{
+	hostEp := &proto.HostEndpoint{
 		Name: "uthost-eth0",
 		PreDnatTiers: []*proto.TierInfo{
 			{
 				Name:            "default",
-				IngressPolicies: []string{"mypolicy"},
+				IngressPolicies: []string{"default.mypolicy"},
 			},
 		},
 	}
 
-	hostEpNorm := proto.HostEndpoint{
+	hostEpNorm := &proto.HostEndpoint{
 		Name: "uthost-eth0",
 		Tiers: []*proto.TierInfo{
 			{
 				Name:            "default",
-				IngressPolicies: []string{"mypolicy"},
-				EgressPolicies:  []string{"mypolicy"},
+				IngressPolicies: []string{"default.mypolicy"},
+				EgressPolicies:  []string{"default.mypolicy"},
 			},
 		},
 	}
@@ -619,11 +650,279 @@ var _ = Describe("BPF Endpoint Manager", func() {
 
 	Context("with workload and host-* endpoints", func() {
 		JustBeforeEach(func() {
+			dp.interfaceByIndexFn = func(ifindex int) (*net.Interface, error) {
+				if ifindex == 10 {
+					return &net.Interface{
+						Name:  "bond0",
+						Index: 10,
+						Flags: net.FlagUp,
+					}, nil
+				}
+				if ifindex == 11 {
+					return &net.Interface{
+						Name:  "bond0.100",
+						Index: 11,
+						Flags: net.FlagUp,
+					}, nil
+				}
+				if ifindex == 20 {
+					return &net.Interface{
+						Name:  "eth10",
+						Index: 20,
+						Flags: net.FlagUp,
+					}, nil
+				}
+				if ifindex == 30 {
+					return &net.Interface{
+						Name:  "eth20",
+						Index: 30,
+						Flags: net.FlagUp,
+					}, nil
+				}
+				return nil, errors.New("no such network interface")
+			}
 			genPolicy("default", "mypolicy")()
-			genIfaceUpdate("eth0", ifacemonitor.StateUp, 10)()
+			genIfaceUpdate("eth0", ifacemonitor.StateUp, 3)()
 			genWLUpdate("cali12345")()
 			genIfaceUpdate("cali12345", ifacemonitor.StateUp, 15)()
 			genHEPUpdate(allInterfaces, hostEpNorm)()
+		})
+
+		It("should attach/detach programs when ifaces are added/deleted", func() {
+			dataIfacePattern = "^eth|bond*"
+			newBpfEpMgr(false)
+			genUntracked("default", "untracked1")()
+			newHEP := googleproto.Clone(hostEp).(*proto.HostEndpoint)
+			newHEP.UntrackedTiers = []*proto.TierInfo{{
+				Name:            "default",
+				IngressPolicies: []string{"untracked1"},
+			}}
+			err := dp.createIface("bond0", 10, "bond")
+			Expect(err).NotTo(HaveOccurred())
+			err = dp.createBondSlaves("eth10", 20, 10)
+			Expect(err).NotTo(HaveOccurred())
+			err = dp.createBondSlaves("eth20", 30, 10)
+			Expect(err).NotTo(HaveOccurred())
+			genHEPUpdate("bond0", newHEP)()
+			genIfaceUpdate("bond0", ifacemonitor.StateUp, 10)()
+			Expect(len(bpfEpMgr.hostIfaceTrees)).To(Equal(1))
+			Expect(dp.programAttached("bond0:ingress")).To(BeTrue())
+			Expect(dp.programAttached("bond0:egress")).To(BeTrue())
+			Expect(dp.programAttached("bond0:xdp")).To(BeTrue())
+
+			genIfaceUpdate("eth10", ifacemonitor.StateUp, 20)()
+			Expect(dp.programAttached("eth10:ingress")).To(BeFalse())
+			Expect(dp.programAttached("eth10:egress")).To(BeFalse())
+			Expect(dp.programAttached("eth10:xdp")).To(BeTrue())
+
+			genIfaceUpdate("eth20", ifacemonitor.StateUp, 30)()
+			Expect(dp.programAttached("eth20:ingress")).To(BeFalse())
+			Expect(dp.programAttached("eth20:egress")).To(BeFalse())
+			Expect(dp.programAttached("eth20:xdp")).To(BeTrue())
+			Expect(dp.programAttached("bond0:ingress")).To(BeTrue())
+			Expect(dp.programAttached("bond0:egress")).To(BeTrue())
+			Expect(dp.programAttached("bond0:xdp")).To(BeFalse())
+
+			err = dp.createVlanIface("bond0.100", 11, 10)
+			Expect(err).NotTo(HaveOccurred())
+			genHEPUpdate("bond0.100", newHEP)()
+			genIfaceUpdate("bond0.100", ifacemonitor.StateUp, 11)()
+			Expect(dp.programAttached("bond0.100:ingress")).To(BeTrue())
+			Expect(dp.programAttached("bond0.100:egress")).To(BeTrue())
+			Expect(dp.programAttached("bond0.100:xdp")).To(BeFalse())
+			Expect(dp.programAttached("bond0:ingress")).To(BeFalse())
+			Expect(dp.programAttached("bond0:egress")).To(BeFalse())
+			Expect(dp.programAttached("bond0:xdp")).To(BeFalse())
+			Expect(dp.programAttached("eth20:ingress")).To(BeFalse())
+			Expect(dp.programAttached("eth20:egress")).To(BeFalse())
+			Expect(dp.programAttached("eth20:xdp")).To(BeTrue())
+			Expect(dp.programAttached("eth10:ingress")).To(BeFalse())
+			Expect(dp.programAttached("eth10:egress")).To(BeFalse())
+			Expect(dp.programAttached("eth10:xdp")).To(BeTrue())
+
+			genIfaceUpdate("bond0.100", ifacemonitor.StateNotPresent, 11)()
+			Expect(dp.programAttached("bond0:ingress")).To(BeTrue())
+			Expect(dp.programAttached("bond0:egress")).To(BeTrue())
+			Expect(dp.programAttached("bond0:xdp")).To(BeFalse())
+			Expect(dp.programAttached("eth10:ingress")).To(BeFalse())
+			Expect(dp.programAttached("eth10:egress")).To(BeFalse())
+			Expect(dp.programAttached("eth10:xdp")).To(BeFalse())
+			Expect(dp.programAttached("eth20:ingress")).To(BeFalse())
+			Expect(dp.programAttached("eth20:egress")).To(BeFalse())
+			Expect(dp.programAttached("eth20:xdp")).To(BeFalse())
+
+			// Delete bond Iface
+			genIfaceUpdate("bond0", ifacemonitor.StateNotPresent, 10)()
+			Expect(dp.programAttached("eth10:ingress")).To(BeTrue())
+			Expect(dp.programAttached("eth10:egress")).To(BeTrue())
+			Expect(dp.programAttached("eth10:xdp")).To(BeFalse())
+			Expect(dp.programAttached("eth20:ingress")).To(BeTrue())
+			Expect(dp.programAttached("eth20:egress")).To(BeTrue())
+			Expect(dp.programAttached("eth20:xdp")).To(BeFalse())
+
+		})
+
+		It("should add host ifaces to iface tree", func() {
+			dataIfacePattern = "^eth|bond*"
+			newBpfEpMgr(false)
+			err := dp.createIface("bond0", 10, "bond")
+			Expect(err).NotTo(HaveOccurred())
+			err = dp.createBondSlaves("eth10", 20, 10)
+			Expect(err).NotTo(HaveOccurred())
+			err = dp.createBondSlaves("eth20", 30, 10)
+			Expect(err).NotTo(HaveOccurred())
+			genIfaceUpdate("bond0", ifacemonitor.StateUp, 10)()
+			genIfaceUpdate("eth10", ifacemonitor.StateUp, 20)()
+			genIfaceUpdate("eth20", ifacemonitor.StateUp, 30)()
+
+			bondIface := bpfEpMgr.hostIfaceTrees.findIfaceByIndex(10)
+			eth10Iface := bpfEpMgr.hostIfaceTrees.findIfaceByIndex(20)
+			eth20Iface := bpfEpMgr.hostIfaceTrees.findIfaceByIndex(30)
+
+			/* Check if bond0, eth10, eth20 exist in the tree and
+			 * at the right position.
+			 */
+			Expect(len(bpfEpMgr.hostIfaceTrees)).To(Equal(1))
+			Expect(bpfEpMgr.hostIfaceTrees).To(HaveKey(10))
+			Expect(bondIface).NotTo(BeNil())
+			Expect(eth10Iface).NotTo(BeNil())
+			Expect(eth20Iface).NotTo(BeNil())
+
+			Expect(isRootIface(bondIface)).To(BeTrue())
+			Expect(isRootIface(eth10Iface)).To(BeFalse())
+			Expect(isRootIface(eth20Iface)).To(BeFalse())
+			Expect(isLeafIface(eth10Iface)).To(BeTrue())
+			Expect(isLeafIface(eth20Iface)).To(BeTrue())
+			Expect(isLeafIface(bondIface)).To(BeFalse())
+
+			// Check if bond slave information is correct.
+			leaves := bpfEpMgr.hostIfaceTrees.getPhyDevices("bond0")
+			Expect(len(leaves)).To(Equal(2))
+			Expect(leaves).To(ConsistOf("eth10", "eth20"))
+
+			// Create bond vlan interface.
+			err = dp.createVlanIface("bond0.100", 11, 10)
+			Expect(err).NotTo(HaveOccurred())
+			genIfaceUpdate("bond0.100", ifacemonitor.StateUp, 11)()
+			Expect(len(bpfEpMgr.hostIfaceTrees)).To(Equal(1))
+			Expect(bpfEpMgr.hostIfaceTrees).To(HaveKey(11))
+
+			// Check if bond vlan interface is the root and bond
+			// is neither a root nor a leaf.
+			bondVlanIface := bpfEpMgr.hostIfaceTrees.findIfaceByIndex(11)
+			Expect(bondVlanIface).NotTo(BeNil())
+			Expect(isRootIface(bondVlanIface)).To(BeTrue())
+			Expect(isRootIface(bondIface)).To(BeFalse())
+			Expect(isLeafIface(bondIface)).To(BeFalse())
+
+			// Validate the tree.
+			val := bpfEpMgr.hostIfaceTrees[11]
+			Expect(len(val.children)).To(Equal(1))
+			Expect(val.children).To(HaveKey(10))
+
+			val = val.children[10]
+			Expect(len(val.children)).To(Equal(2))
+			Expect(val.children).To(HaveKey(20))
+			Expect(val.children).To(HaveKey(30))
+
+			leaves = bpfEpMgr.hostIfaceTrees.getPhyDevices("bond0.100")
+			Expect(len(leaves)).To(Equal(2))
+			Expect(leaves).To(ConsistOf("eth10", "eth20"))
+			leaves = bpfEpMgr.hostIfaceTrees.getPhyDevices("eth10")
+			Expect(len(leaves)).To(Equal(0))
+			leaves = bpfEpMgr.hostIfaceTrees.getPhyDevices("eth0")
+			Expect(len(leaves)).To(Equal(0))
+
+			// Add a new iface eth0.
+			genIfaceUpdate("eth0", ifacemonitor.StateUp, 3)()
+			Expect(len(bpfEpMgr.hostIfaceTrees)).To(Equal(2))
+			eth0Iface := bpfEpMgr.hostIfaceTrees.findIfaceByIndex(3)
+			Expect(eth0Iface).NotTo(BeNil())
+			Expect(isRootIface(eth0Iface)).To(BeTrue())
+			Expect(isLeafIface(eth0Iface)).To(BeTrue())
+
+			// Delete vlan interface.
+			genIfaceUpdate("bond0.100", ifacemonitor.StateNotPresent, 11)()
+			Expect(len(bpfEpMgr.hostIfaceTrees)).To(Equal(2))
+			Expect(bpfEpMgr.hostIfaceTrees).To(HaveKey(10))
+			Expect(bpfEpMgr.hostIfaceTrees).To(HaveKey(3))
+			bondVlanIface = bpfEpMgr.hostIfaceTrees.findIfaceByIndex(11)
+			Expect(bondVlanIface).To(BeNil())
+			bondIface = bpfEpMgr.hostIfaceTrees.findIfaceByIndex(10)
+			eth10Iface = bpfEpMgr.hostIfaceTrees.findIfaceByIndex(20)
+			eth20Iface = bpfEpMgr.hostIfaceTrees.findIfaceByIndex(30)
+			Expect(bondIface).NotTo(BeNil())
+			Expect(eth10Iface).NotTo(BeNil())
+			Expect(eth20Iface).NotTo(BeNil())
+			Expect(isRootIface(bondIface)).To(BeTrue())
+			Expect(isLeafIface(bondIface)).To(BeFalse())
+			Expect(isLeafIface(eth10Iface)).To(BeTrue())
+			Expect(isLeafIface(eth20Iface)).To(BeTrue())
+
+			leaves = bpfEpMgr.hostIfaceTrees.getPhyDevices("bond0")
+			Expect(len(leaves)).To(Equal(2))
+			Expect(leaves).To(ConsistOf("eth10", "eth20"))
+
+			// Delete bond interface.
+			genIfaceUpdate("bond0", ifacemonitor.StateNotPresent, 10)()
+			Expect(len(bpfEpMgr.hostIfaceTrees)).To(Equal(3))
+			Expect(bpfEpMgr.hostIfaceTrees).To(HaveKey(3))
+			Expect(bpfEpMgr.hostIfaceTrees).To(HaveKey(20))
+			Expect(bpfEpMgr.hostIfaceTrees).To(HaveKey(30))
+			bondIface = bpfEpMgr.hostIfaceTrees.findIfaceByIndex(10)
+			eth10Iface = bpfEpMgr.hostIfaceTrees.findIfaceByIndex(20)
+			eth20Iface = bpfEpMgr.hostIfaceTrees.findIfaceByIndex(30)
+			Expect(bondIface).To(BeNil())
+			Expect(eth10Iface).NotTo(BeNil())
+			Expect(eth20Iface).NotTo(BeNil())
+			Expect(isLeafIface(eth10Iface)).To(BeTrue())
+			Expect(isLeafIface(eth20Iface)).To(BeTrue())
+			Expect(isRootIface(eth10Iface)).To(BeTrue())
+			Expect(isRootIface(eth20Iface)).To(BeTrue())
+
+			// Add the interfaces again.
+			genIfaceUpdate("bond0", ifacemonitor.StateUp, 10)()
+			genIfaceUpdate("eth10", ifacemonitor.StateUp, 20)()
+			genIfaceUpdate("eth20", ifacemonitor.StateUp, 30)()
+			Expect(len(bpfEpMgr.hostIfaceTrees)).To(Equal(2))
+			Expect(bpfEpMgr.hostIfaceTrees).To(HaveKey(3))
+			Expect(bpfEpMgr.hostIfaceTrees).To(HaveKey(10))
+
+			genIfaceUpdate("bond0.100", ifacemonitor.StateUp, 11)()
+			Expect(len(bpfEpMgr.hostIfaceTrees)).To(Equal(2))
+			Expect(bpfEpMgr.hostIfaceTrees).To(HaveKey(3))
+			Expect(bpfEpMgr.hostIfaceTrees).To(HaveKey(11))
+			bondIface = bpfEpMgr.hostIfaceTrees.findIfaceByIndex(10)
+			bondVlanIface = bpfEpMgr.hostIfaceTrees.findIfaceByIndex(11)
+			eth10Iface = bpfEpMgr.hostIfaceTrees.findIfaceByIndex(20)
+			eth20Iface = bpfEpMgr.hostIfaceTrees.findIfaceByIndex(30)
+			Expect(bondVlanIface).NotTo(BeNil())
+			Expect(bondIface).NotTo(BeNil())
+			Expect(eth10Iface).NotTo(BeNil())
+			Expect(eth20Iface).NotTo(BeNil())
+			Expect(isRootIface(bondVlanIface)).To(BeTrue())
+			Expect(isLeafIface(bondVlanIface)).To(BeFalse())
+			Expect(isRootIface(bondIface)).To(BeFalse())
+			Expect(isLeafIface(bondIface)).To(BeFalse())
+			Expect(isRootIface(eth10Iface)).To(BeFalse())
+			Expect(isRootIface(eth20Iface)).To(BeFalse())
+			Expect(isLeafIface(eth10Iface)).To(BeTrue())
+			Expect(isLeafIface(eth20Iface)).To(BeTrue())
+
+			// Delete the bond, which is neither root not leaf.
+			genIfaceUpdate("bond0", ifacemonitor.StateNotPresent, 10)()
+			Expect(len(bpfEpMgr.hostIfaceTrees)).To(Equal(3))
+			Expect(bpfEpMgr.hostIfaceTrees).To(HaveKey(3))
+			Expect(bpfEpMgr.hostIfaceTrees).To(HaveKey(20))
+			Expect(bpfEpMgr.hostIfaceTrees).To(HaveKey(30))
+			eth10Iface = bpfEpMgr.hostIfaceTrees.findIfaceByIndex(20)
+			eth20Iface = bpfEpMgr.hostIfaceTrees.findIfaceByIndex(30)
+			Expect(eth10Iface).NotTo(BeNil())
+			Expect(eth20Iface).NotTo(BeNil())
+			Expect(isRootIface(eth10Iface)).To(BeTrue())
+			Expect(isRootIface(eth20Iface)).To(BeTrue())
+			Expect(isLeafIface(eth10Iface)).To(BeTrue())
+			Expect(isLeafIface(eth20Iface)).To(BeTrue())
 		})
 
 		It("does not have host-* policy on the workload interface", func() {
@@ -747,6 +1046,69 @@ var _ = Describe("BPF Endpoint Manager", func() {
 		})
 	})
 
+	Context("with bond iface and vlan", func() {
+		JustBeforeEach(func() {
+			dp.interfaceByIndexFn = func(ifindex int) (*net.Interface, error) {
+				if ifindex == 10 {
+					return &net.Interface{
+						Name:  "bond0",
+						Index: 10,
+						Flags: net.FlagUp,
+					}, nil
+				}
+				if ifindex == 11 {
+					return &net.Interface{
+						Name:  "bond0.100",
+						Index: 11,
+						Flags: net.FlagUp,
+					}, nil
+				}
+				if ifindex == 20 {
+					return &net.Interface{
+						Name:  "eth10",
+						Index: 20,
+						Flags: net.FlagUp,
+					}, nil
+				}
+				if ifindex == 30 {
+					return &net.Interface{
+						Name:  "eth20",
+						Index: 30,
+						Flags: net.FlagUp,
+					}, nil
+				}
+				return nil, errors.New("no such network interface")
+			}
+			err := dp.createIface("bond0", 10, "bond")
+			Expect(err).NotTo(HaveOccurred())
+			err = dp.createVlanIface("bond0.100", 11, 10)
+			Expect(err).NotTo(HaveOccurred())
+			err = dp.createBondSlaves("eth10", 20, 10)
+			Expect(err).NotTo(HaveOccurred())
+			err = dp.createBondSlaves("eth20", 30, 10)
+			Expect(err).NotTo(HaveOccurred())
+			dataIfacePattern = "^eth|bond*"
+			newBpfEpMgr(false)
+			err = bpfEpMgr.CompleteDeferredWork()
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		Context("should attach to bond interface", func() {
+			It("should attach tc to bond", func() {
+				genIfaceUpdate("bond0", ifacemonitor.StateUp, 10)()
+				genIfaceUpdate("eth10", ifacemonitor.StateUp, 20)()
+				genIfaceUpdate("eth20", ifacemonitor.StateUp, 30)()
+				Expect(dp.programAttached("bond0:ingress")).To(BeTrue())
+				Expect(dp.programAttached("bond0:egress")).To(BeTrue())
+				Expect(dp.programAttached("bond0:xdp")).To(BeFalse())
+				Expect(dp.programAttached("eth10:ingress")).To(BeFalse())
+				Expect(dp.programAttached("eth10:egress")).To(BeFalse())
+				Expect(dp.programAttached("eth20:ingress")).To(BeFalse())
+				Expect(dp.programAttached("eth20:egress")).To(BeFalse())
+			})
+		})
+	})
+
 	Context("with bond iface", func() {
 		JustBeforeEach(func() {
 			dp.interfaceByIndexFn = func(ifindex int) (*net.Interface, error) {
@@ -761,6 +1123,13 @@ var _ = Describe("BPF Endpoint Manager", func() {
 					return &net.Interface{
 						Name:  "foo0",
 						Index: 11,
+						Flags: net.FlagUp,
+					}, nil
+				}
+				if ifindex == 12 {
+					return &net.Interface{
+						Name:  "bond1",
+						Index: 12,
 						Flags: net.FlagUp,
 					}, nil
 				}
@@ -786,12 +1155,41 @@ var _ = Describe("BPF Endpoint Manager", func() {
 				Expect(dp.programAttached("bond0:ingress")).To(BeTrue())
 				Expect(dp.programAttached("bond0:egress")).To(BeTrue())
 				checkIfState(10, "bond0", ifstate.FlgIPv4Ready|ifstate.FlgBond)
+				Expect(dp.programAttached("bond0:xdp")).To(BeFalse())
 			})
 			It("should not attach to bond slaves", func() {
 				Expect(dp.programAttached("eth10:ingress")).To(BeFalse())
 				Expect(dp.programAttached("eth10:egress")).To(BeFalse())
 				Expect(dp.programAttached("eth20:ingress")).To(BeFalse())
 				Expect(dp.programAttached("eth20:egress")).To(BeFalse())
+			})
+
+			It("should attach xdp to slave interfaces when the slave interface update is received first", func() {
+				err := dp.createBondSlaves("eth11", 21, 12)
+				Expect(err).NotTo(HaveOccurred())
+				err = dp.createBondSlaves("eth21", 31, 12)
+				Expect(err).NotTo(HaveOccurred())
+				err = dp.createIface("bond1", 12, "bond")
+				Expect(err).NotTo(HaveOccurred())
+
+				genIfaceUpdate("eth11", ifacemonitor.StateUp, 21)()
+				genIfaceUpdate("eth21", ifacemonitor.StateUp, 31)()
+				genIfaceUpdate("bond1", ifacemonitor.StateUp, 12)()
+				genUntracked("default", "untracked1")()
+				newHEP := googleproto.Clone(hostEp).(*proto.HostEndpoint)
+				newHEP.UntrackedTiers = []*proto.TierInfo{{
+					Name:            "default",
+					IngressPolicies: []string{"untracked1"},
+				}}
+				genHEPUpdate("bond1", newHEP)()
+				err = bpfEpMgr.CompleteDeferredWork()
+				Expect(err).NotTo(HaveOccurred())
+				Expect(dp.programAttached("eth11:ingress")).To(BeFalse())
+				Expect(dp.programAttached("eth11:egress")).To(BeFalse())
+				Expect(dp.programAttached("eth21:ingress")).To(BeFalse())
+				Expect(dp.programAttached("eth21:egress")).To(BeFalse())
+				Expect(dp.programAttached("eth11:xdp")).To(BeTrue())
+				Expect(dp.programAttached("eth21:xdp")).To(BeTrue())
 			})
 
 			It("should attach to interfaces when it is removed from bond", func() {
@@ -831,12 +1229,46 @@ var _ = Describe("BPF Endpoint Manager", func() {
 				genIfaceUpdate("eth11", ifacemonitor.StateNotPresent, 21)()
 				genIfaceUpdate("foo0", ifacemonitor.StateNotPresent, 11)()
 			})
+
+			It("should attach XDP to slave devices", func() {
+				By("adding untracked policy")
+				genUntracked("default", "untracked1")()
+				newHEP := googleproto.Clone(hostEp).(*proto.HostEndpoint)
+				newHEP.UntrackedTiers = []*proto.TierInfo{{
+					Name:            "default",
+					IngressPolicies: []string{"untracked1"},
+				}}
+				genHEPUpdate("bond0", newHEP)()
+				err := bpfEpMgr.CompleteDeferredWork()
+				Expect(err).NotTo(HaveOccurred())
+
+				Expect(dp.programAttached("bond0:ingress")).To(BeTrue())
+				Expect(dp.programAttached("bond0:egress")).To(BeTrue())
+				Expect(dp.programAttached("bond0:xdp")).To(BeFalse())
+				checkIfState(10, "bond0", ifstate.FlgIPv4Ready|ifstate.FlgBond)
+
+				Expect(dp.programAttached("eth10:ingress")).To(BeFalse())
+				Expect(dp.programAttached("eth10:egress")).To(BeFalse())
+				Expect(dp.programAttached("eth20:ingress")).To(BeFalse())
+				Expect(dp.programAttached("eth20:egress")).To(BeFalse())
+				Expect(dp.programAttached("eth10:xdp")).To(BeTrue())
+				Expect(dp.programAttached("eth20:xdp")).To(BeTrue())
+
+				By("removing the untracked policy")
+				genHEPUpdate("bond0", hostEp)()
+				err = bpfEpMgr.CompleteDeferredWork()
+				Expect(err).NotTo(HaveOccurred())
+				Expect(dp.programAttached("bond0:ingress")).To(BeTrue())
+				Expect(dp.programAttached("bond0:egress")).To(BeTrue())
+				Expect(dp.programAttached("eth10:xdp")).To(BeFalse())
+				Expect(dp.programAttached("eth20:xdp")).To(BeFalse())
+			})
 		})
 	})
 
 	Context("with eth0 up", func() {
 		JustBeforeEach(func() {
-			genPolicy("default", "mypolicy")()
+			genPolicy("default", "default.mypolicy")()
 			genIfaceUpdate("eth0", ifacemonitor.StateUp, 10)()
 		})
 
@@ -913,9 +1345,9 @@ var _ = Describe("BPF Endpoint Manager", func() {
 
 			It("stores host endpoint for eth0", func() {
 				Expect(bpfEpMgr.hostIfaceToEpMap["eth0"]).To(Equal(hostEp))
-				Expect(bpfEpMgr.policiesToWorkloads[proto.PolicyID{
+				Expect(bpfEpMgr.policiesToWorkloads[types.PolicyID{
 					Tier: "default",
-					Name: "mypolicy",
+					Name: "default.mypolicy",
 				}]).To(HaveKey("eth0"))
 
 				var eth0I, eth0E, eth0X *polprog.Rules
@@ -936,7 +1368,7 @@ var _ = Describe("BPF Endpoint Manager", func() {
 
 				By("adding untracked policy")
 				genUntracked("default", "untracked1")()
-				newHEP := hostEp
+				newHEP := googleproto.Clone(hostEp).(*proto.HostEndpoint)
 				newHEP.UntrackedTiers = []*proto.TierInfo{{
 					Name:            "default",
 					IngressPolicies: []string{"untracked1"},
@@ -963,9 +1395,9 @@ var _ = Describe("BPF Endpoint Manager", func() {
 
 			It("stores host endpoint for eth0", func() {
 				Expect(bpfEpMgr.hostIfaceToEpMap["eth0"]).To(Equal(hostEp))
-				Expect(bpfEpMgr.policiesToWorkloads[proto.PolicyID{
+				Expect(bpfEpMgr.policiesToWorkloads[types.PolicyID{
 					Tier: "default",
-					Name: "mypolicy",
+					Name: "default.mypolicy",
 				}]).To(HaveKey("eth0"))
 			})
 		})
@@ -973,7 +1405,7 @@ var _ = Describe("BPF Endpoint Manager", func() {
 
 	Context("with eth0 host endpoint", func() {
 		JustBeforeEach(func() {
-			genPolicy("default", "mypolicy")()
+			genPolicy("default", "default.mypolicy")()
 			genHEPUpdate("eth0", hostEp)()
 		})
 
@@ -982,9 +1414,9 @@ var _ = Describe("BPF Endpoint Manager", func() {
 
 			It("stores host endpoint for eth0", func() {
 				Expect(bpfEpMgr.hostIfaceToEpMap["eth0"]).To(Equal(hostEp))
-				Expect(bpfEpMgr.policiesToWorkloads[proto.PolicyID{
+				Expect(bpfEpMgr.policiesToWorkloads[types.PolicyID{
 					Tier: "default",
-					Name: "mypolicy",
+					Name: "default.mypolicy",
 				}]).To(HaveKey("eth0"))
 			})
 		})
@@ -992,7 +1424,7 @@ var _ = Describe("BPF Endpoint Manager", func() {
 
 	Context("with host-* endpoint", func() {
 		JustBeforeEach(func() {
-			genPolicy("default", "mypolicy")()
+			genPolicy("default", "default.mypolicy")()
 			genHEPUpdate(allInterfaces, hostEp)()
 		})
 
@@ -1001,9 +1433,9 @@ var _ = Describe("BPF Endpoint Manager", func() {
 
 			It("stores host endpoint for eth0", func() {
 				Expect(bpfEpMgr.hostIfaceToEpMap["eth0"]).To(Equal(hostEp))
-				Expect(bpfEpMgr.policiesToWorkloads[proto.PolicyID{
+				Expect(bpfEpMgr.policiesToWorkloads[types.PolicyID{
 					Tier: "default",
-					Name: "mypolicy",
+					Name: "default.mypolicy",
 				}]).To(HaveKey("eth0"))
 			})
 
@@ -1012,9 +1444,9 @@ var _ = Describe("BPF Endpoint Manager", func() {
 
 				It("clears host endpoint for eth0", func() {
 					Expect(bpfEpMgr.hostIfaceToEpMap).To(BeEmpty())
-					Expect(bpfEpMgr.policiesToWorkloads[proto.PolicyID{
+					Expect(bpfEpMgr.policiesToWorkloads[types.PolicyID{
 						Tier: "default",
-						Name: "mypolicy",
+						Name: "default.mypolicy",
 					}]).NotTo(HaveKey("eth0"))
 				})
 			})
@@ -1023,9 +1455,9 @@ var _ = Describe("BPF Endpoint Manager", func() {
 
 				It("clears host endpoint for eth0", func() {
 					Expect(bpfEpMgr.hostIfaceToEpMap).To(BeEmpty())
-					Expect(bpfEpMgr.policiesToWorkloads[proto.PolicyID{
+					Expect(bpfEpMgr.policiesToWorkloads[types.PolicyID{
 						Tier: "default",
-						Name: "mypolicy",
+						Name: "default.mypolicy",
 					}]).NotTo(HaveKey("eth0"))
 				})
 			})
@@ -1318,6 +1750,9 @@ var _ = Describe("BPF Endpoint Manager", func() {
 		}
 
 		It("should reclaim indexes for active interfaces", func() {
+			bpfEpMgr.bpfLogLevel = "debug"
+			bpfEpMgr.logFilters = map[string]string{"all": "tcp"}
+
 			for i := 0; i < 8; i++ {
 				_ = jumpMap.Update(jump.Key(i), jump.Value(uint32(1000+i)))
 				_ = jumpMap.Update(jump.Key(i+jump.TCMaxEntryPoints), jump.Value(uint32(1000+i)))
@@ -1359,17 +1794,17 @@ var _ = Describe("BPF Endpoint Manager", func() {
 				123: value123.String(),
 			}))
 
-			// Expect clean-up deletions but no value changes due to mocking.
-			Expect(dumpJumpMap(jumpMap)).To(Equal(map[int]int{
-				0:     1000,
-				2:     1002,
-				3:     1003,
-				4:     1004,
-				10000: 1000,
-				10002: 1002,
-				10003: 1003,
-				10004: 1004,
-			}))
+			// Expect clean-up deletions.
+			jmps := dumpJumpMap(jumpMap)
+			Expect(jmps).To(HaveLen(8))
+			Expect(jmps).To(HaveKey(0)) /* filters reloaded to reflect current expressions */
+			Expect(jmps).To(HaveKey(2))
+			Expect(jmps).To(HaveKey(3))
+			Expect(jmps).To(HaveKey(4))
+			Expect(jmps).To(HaveKeyWithValue(10000, 1000))
+			Expect(jmps).To(HaveKeyWithValue(10002, 1002))
+			Expect(jmps).To(HaveKeyWithValue(10003, 1003))
+			Expect(jmps).To(HaveKeyWithValue(10004, 1004))
 			Expect(dumpJumpMap(xdpJumpMap)).To(Equal(map[int]int{
 				1: 2001,
 			}))
@@ -1574,6 +2009,30 @@ var _ = Describe("BPF Endpoint Manager", func() {
 			checkIfState(15, "cali12345", flags)
 		})
 
+		It("check bpf endpoint count after pod churn", func() {
+			start := bpfEpMgr.getNumEPs()
+			for i := 0; i < 3; i++ {
+				name := fmt.Sprintf("cali%d", i)
+				genIfaceUpdate(name, ifacemonitor.StateUp, 1000+i)()
+				genWLUpdate(name)()
+
+				err := bpfEpMgr.CompleteDeferredWork()
+				Expect(err).NotTo(HaveOccurred())
+
+				genIfaceUpdate(name, ifacemonitor.StateDown, 1000+i)()
+
+				err = bpfEpMgr.CompleteDeferredWork()
+				Expect(err).NotTo(HaveOccurred())
+
+				genWLUpdateEpRemove(name)()
+
+				err = bpfEpMgr.CompleteDeferredWork()
+				Expect(err).NotTo(HaveOccurred())
+			}
+			end := bpfEpMgr.getNumEPs()
+			Expect(end).To(Equal(start))
+		})
+
 		It("iface up -> wl", func() {
 			genIfaceUpdate("cali12345", ifacemonitor.StateUp, 15)()
 			genWLUpdate("cali12345")()
@@ -1688,6 +2147,9 @@ var _ = Describe("BPF Endpoint Manager", func() {
 			newBpfEpMgr(true)
 		})
 		It("should clean up jump map entries for missing interfaces", func() {
+			bpfEpMgr.bpfLogLevel = "debug"
+			bpfEpMgr.logFilters = map[string]string{"all": "tcp"}
+
 			for i := 0; i < 17; i++ {
 				_ = jumpMap.Update(jump.Key(i), jump.Value(uint32(1000+i)))
 				_ = jumpMap.Update(jump.Key(i+jump.TCMaxEntryPoints), jump.Value(uint32(1000+i)))
@@ -1752,6 +2214,9 @@ var _ = Describe("BPF Endpoint Manager", func() {
 		}
 
 		It("should reclaim indexes for active interfaces", func() {
+			bpfEpMgr.bpfLogLevel = "debug"
+			bpfEpMgr.logFilters = map[string]string{"all": "tcp"}
+
 			for i := 0; i < 8; i++ {
 				_ = jumpMap.Update(jump.Key(i), jump.Value(uint32(1000+i)))
 				_ = jumpMap.Update(jump.Key(i+jump.TCMaxEntryPoints), jump.Value(uint32(1000+i)))
@@ -1794,13 +2259,14 @@ var _ = Describe("BPF Endpoint Manager", func() {
 				123: value123.String(),
 			}))
 
-			// Expect clean-up deletions but no value changes due to mocking.
-			Expect(dumpJumpMap(jumpMap)).To(Equal(map[int]int{
-				2:     1002,
-				3:     1003,
-				10002: 1002,
-				10003: 1003,
-			}))
+			// Expect clean-up deletions.
+			jmps := dumpJumpMap(jumpMap)
+			Expect(jmps).To(HaveLen(5))
+			Expect(jmps).To(HaveKey(2)) /* filters reloaded to reflect current expressions */
+			Expect(jmps).To(HaveKey(3))
+			Expect(jmps).To(HaveKey(4))
+			Expect(jmps).To(HaveKeyWithValue(10002, 1002))
+			Expect(jmps).To(HaveKeyWithValue(10003, 1003))
 			Expect(dumpJumpMap(xdpJumpMap)).To(Equal(map[int]int{
 				1: 2001,
 			}))
@@ -2159,7 +2625,7 @@ var _ = Describe("BPF Endpoint Manager", func() {
 			genIfaceUpdate("eth0", ifacemonitor.StateUp, 10)()
 			genUntracked("default", "untracked1")()
 			genPolicy("default", "mypolicy")()
-			hostEp := hostEpNorm
+			hostEp := googleproto.Clone(hostEpNorm).(*proto.HostEndpoint)
 			hostEp.UntrackedTiers = []*proto.TierInfo{{
 				Name:            "default",
 				IngressPolicies: []string{"untracked1"},

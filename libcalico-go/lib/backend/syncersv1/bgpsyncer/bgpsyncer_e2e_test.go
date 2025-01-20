@@ -20,10 +20,9 @@ import (
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/projectcalico/api/pkg/lib/numorstring"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
@@ -60,7 +59,8 @@ var _ = testutils.E2eDatastoreDescribe("BGP syncer tests", testutils.DatastoreAl
 			// Create the backend client to obtain a syncer interface.
 			be, err := backend.NewClient(config)
 			Expect(err).NotTo(HaveOccurred())
-			be.Clean()
+			err = be.Clean()
+			Expect(err).NotTo(HaveOccurred())
 
 			// Create a SyncerTester to receive the BGP syncer callback events and to allow us
 			// to assert state.
@@ -156,7 +156,7 @@ var _ = testutils.E2eDatastoreDescribe("BGP syncer tests", testutils.DatastoreAl
 			Expect(err).NotTo(HaveOccurred())
 
 			syncTester.ExpectCacheSize(expectedCacheSize)
-			syncTester.ExpectNoData(model.GlobalBGPConfigKey{"as_num"})
+			syncTester.ExpectNoData(model.GlobalBGPConfigKey{Name: "as_num"})
 
 			By("Creating an IPPool")
 			poolCIDR := "192.124.0.0/21"
@@ -181,12 +181,13 @@ var _ = testutils.E2eDatastoreDescribe("BGP syncer tests", testutils.DatastoreAl
 			syncTester.ExpectData(model.KVPair{
 				Key: poolKeyV1,
 				Value: &model.IPPool{
-					CIDR:          poolCIDRNet,
-					IPIPInterface: "tunl0",
-					IPIPMode:      encap.CrossSubnet,
-					Masquerade:    true,
-					IPAM:          true,
-					Disabled:      false,
+					CIDR:           poolCIDRNet,
+					IPIPInterface:  "tunl0",
+					IPIPMode:       encap.CrossSubnet,
+					Masquerade:     true,
+					IPAM:           true,
+					Disabled:       false,
+					AssignmentMode: apiv3.Automatic,
 				},
 				Revision: pool.ResourceVersion,
 			})
@@ -280,7 +281,7 @@ var _ = testutils.E2eDatastoreDescribe("BGP syncer tests", testutils.DatastoreAl
 				current := syncTester.GetCacheEntries()
 				for _, kvp := range current {
 					if kab, ok := kvp.Key.(model.BlockAffinityKey); ok {
-						if kab.Host == "127.0.0.1" && poolCIDRNet.Contains(kab.CIDR.IP) {
+						if kab.Host == "127.0.0.1" && poolCIDRNet.Contains(kab.CIDR.IP) && kab.AffinityType == string(ipam.AffinityTypeHost) {
 							blockAffinityKeyV1 = kab
 							break
 						}

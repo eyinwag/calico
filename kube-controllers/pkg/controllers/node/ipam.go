@@ -22,23 +22,21 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/time/rate"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/cache"
-
-	"github.com/projectcalico/calico/kube-controllers/pkg/controllers/flannelmigration"
-
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/time/rate"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	v1lister "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
-	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
 	"github.com/projectcalico/calico/kube-controllers/pkg/config"
+	"github.com/projectcalico/calico/kube-controllers/pkg/controllers/flannelmigration"
+	"github.com/projectcalico/calico/kube-controllers/pkg/controllers/utils"
 	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
 	bapi "github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
@@ -129,10 +127,10 @@ func NewIPAMController(cfg config.NodeControllerConfig, c client.Interface, cs k
 		client:    c,
 		clientset: cs,
 		config:    cfg,
-		rl: workqueue.NewMaxOfRateLimiter(
-			workqueue.NewItemExponentialFailureRateLimiter(5*time.Millisecond, 30*time.Second),
+		rl: workqueue.NewTypedMaxOfRateLimiter(
+			workqueue.NewTypedItemExponentialFailureRateLimiter[any](5*time.Millisecond, 30*time.Second),
 			// 10 qps, 100 bucket size.  This is only for retry speed and its only the overall factor (not per item)
-			&workqueue.BucketRateLimiter{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
+			&workqueue.TypedBucketRateLimiter[any]{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
 		),
 
 		syncChan: make(chan interface{}, 1),
@@ -164,7 +162,7 @@ func NewIPAMController(cfg config.NodeControllerConfig, c client.Interface, cs k
 }
 
 type ipamController struct {
-	rl         workqueue.RateLimiter
+	rl         workqueue.TypedRateLimiter[any]
 	client     client.Interface
 	clientset  kubernetes.Interface
 	podLister  v1lister.PodLister
@@ -207,7 +205,7 @@ func (c *ipamController) Start(stop chan struct{}) {
 	go c.acceptScheduleRequests(stop)
 }
 
-func (c *ipamController) RegisterWith(f *DataFeed) {
+func (c *ipamController) RegisterWith(f *utils.DataFeed) {
 	f.RegisterForNotification(model.BlockKey{}, c.onUpdate)
 	f.RegisterForNotification(model.ResourceKey{}, c.onUpdate)
 	f.RegisterForSyncStatus(c.onStatusUpdate)
@@ -1064,8 +1062,13 @@ func (c *ipamController) cleanupNode(cnode string) error {
 	// are tied to pods which don't exist anymore. Clean up any allocations which may still be laying around.
 	logc := log.WithField("calicoNode", cnode)
 
+	affinityCfg := ipam.AffinityConfig{
+		AffinityType: ipam.AffinityTypeHost,
+		Host:         cnode,
+	}
+
 	// Release the affinities for this node, requiring that the blocks are empty.
-	if err := c.client.IPAM().ReleaseHostAffinities(context.TODO(), cnode, true); err != nil {
+	if err := c.client.IPAM().ReleaseHostAffinities(context.TODO(), affinityCfg, true); err != nil {
 		logc.WithError(err).Errorf("Failed to release block affinities for node")
 		return err
 	}

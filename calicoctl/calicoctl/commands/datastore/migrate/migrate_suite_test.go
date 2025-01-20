@@ -12,15 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package migrate_test
+package migrate
 
 import (
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
-
 	"testing"
 
+	. "github.com/onsi/ginkgo"
 	"github.com/onsi/ginkgo/reporters"
+	. "github.com/onsi/gomega"
 )
 
 func TestCommands(t *testing.T) {

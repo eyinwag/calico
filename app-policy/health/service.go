@@ -17,13 +17,14 @@ package health
 import (
 	"context"
 
-	dikastesproto "github.com/projectcalico/calico/app-policy/proto"
-
 	log "github.com/sirupsen/logrus"
+
+	dikastesproto "github.com/projectcalico/calico/app-policy/proto"
 )
 
 // An implementation of the HealthzServer health check service.
 type healthCheckService struct {
+	dikastesproto.UnimplementedHealthzServer
 	reporter ReadinessReporter
 }
 

@@ -28,11 +28,10 @@ import (
 	"syscall"
 	"time"
 
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 	"k8s.io/client-go/kubernetes"
-
-	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
 	"github.com/projectcalico/calico/felix/buildinfo"
 	"github.com/projectcalico/calico/felix/calc"
@@ -373,6 +372,18 @@ configRetry:
 		}
 	}
 
+	if configParams.BPFEnabled && configParams.IPForwarding == "Disabled" && configParams.BPFEnforceRPF != "Disabled" {
+		// BPF mode requires IP forwarding to be enabled because the BPF RPF
+		// check fails if it is disabled.  Seems to be an incorrect check in
+		// the kernel.  FIB lookups can only be done for interfaces that have
+		// forwarding enabled.
+		log.Warning("In BPF mode, either IPForwarding must be enabled or BPFEnforceRPF must be disabled. Forcing IPForwarding to 'Enabled'.")
+		_, err := configParams.OverrideParam("IPForwarding", "Enabled")
+		if err != nil {
+			log.WithError(err).Panic("Bug: failed to override config parameter")
+		}
+	}
+
 	// Set any watchdog timeout overrides before we initialise components.
 	health.SetGlobalTimeoutOverrides(configParams.HealthTimeoutOverrides)
 
@@ -647,7 +658,7 @@ configRetry:
 
 	if configParams.EndpointStatusPathPrefix != "" {
 		if runtime.GOOS == "windows" {
-			log.WithField("os", runtime.GOOS).Warn("EndpointStatusPathPrefix is currently unsupported on Windows. Ignoring config...")
+			log.WithField("os", runtime.GOOS).Info("EndpointStatusPathPrefix is currently unsupported on Windows. Ignoring config...")
 		} else {
 			fromDataplaneC := dpConnector.NewFromDataplaneConsumer()
 			statusFileReporter := statusrep.NewEndpointStatusFileReporter(fromDataplaneC, configParams.EndpointStatusPathPrefix, statusrep.WithHostname(configParams.FelixHostname))
@@ -1101,7 +1112,7 @@ func (fc *DataplaneConnector) readMessagesFromDataplane() {
 }
 
 func (fc *DataplaneConnector) handleProcessStatusUpdate(ctx context.Context, msg *proto.ProcessStatusUpdate) {
-	log.Debugf("Status update from dataplane driver: %v", *msg)
+	log.Debugf("Status update from dataplane driver: %v", msg)
 	statusReport := model.StatusReport{
 		Timestamp:     msg.IsoTimestamp,
 		UptimeSeconds: msg.Uptime,

@@ -16,17 +16,16 @@ package resources
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"reflect"
 	"strings"
 
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	log "github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-
-	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
 	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
@@ -39,7 +38,7 @@ const (
 	IPAMHandleCRDName      = "ipamhandles.crd.projectcalico.org"
 )
 
-func NewIPAMHandleClient(c *kubernetes.Clientset, r *rest.RESTClient) K8sResourceClient {
+func NewIPAMHandleClient(c kubernetes.Interface, r rest.Interface) K8sResourceClient {
 	// Create a resource client which manages k8s CRDs.
 	rc := customK8sResourceClient{
 		clientSet:       c,
@@ -68,7 +67,7 @@ type ipamHandleClient struct {
 	rc customK8sResourceClient
 }
 
-func (c ipamHandleClient) toV1(kvpv3 *model.KVPair) *model.KVPair {
+func (c *ipamHandleClient) toV1(kvpv3 *model.KVPair) *model.KVPair {
 	v3Handle := kvpv3.Value.(*libapiv3.IPAMHandle)
 	handleID := v3Handle.Spec.HandleID
 	block := v3Handle.Spec.Block
@@ -87,11 +86,11 @@ func (c ipamHandleClient) toV1(kvpv3 *model.KVPair) *model.KVPair {
 	}
 }
 
-func (c ipamHandleClient) parseKey(k model.Key) string {
+func (c *ipamHandleClient) parseKey(k model.Key) string {
 	return strings.ToLower(k.(model.IPAMHandleKey).HandleID)
 }
 
-func (c ipamHandleClient) toV3(kvpv1 *model.KVPair) *model.KVPair {
+func (c *ipamHandleClient) toV3(kvpv1 *model.KVPair) *model.KVPair {
 	name := c.parseKey(kvpv1.Key)
 	handle := kvpv1.Key.(model.IPAMHandleKey).HandleID
 	block := kvpv1.Value.(*model.IPAMHandle).Block
@@ -190,7 +189,7 @@ func (c *ipamHandleClient) Get(ctx context.Context, key model.Key, revision stri
 		if _, err := c.DeleteKVP(ctx, v1kvp); err != nil {
 			return nil, err
 		}
-		return nil, cerrors.ErrorResourceDoesNotExist{fmt.Errorf("Resource was deleted"), key}
+		return nil, cerrors.ErrorResourceDoesNotExist{Err: errors.New("resource was deleted"), Identifier: key}
 	}
 
 	return v1kvp, nil
@@ -203,7 +202,10 @@ func (c *ipamHandleClient) List(ctx context.Context, list model.ListInterface, r
 		return nil, err
 	}
 
-	kvpl := &model.KVPairList{KVPairs: []*model.KVPair{}}
+	kvpl := &model.KVPairList{
+		KVPairs:  []*model.KVPair{},
+		Revision: v3list.Revision,
+	}
 	for _, i := range v3list.KVPairs {
 		v1kvp := c.toV1(i)
 		kvpl.KVPairs = append(kvpl.KVPairs, v1kvp)
@@ -211,7 +213,7 @@ func (c *ipamHandleClient) List(ctx context.Context, list model.ListInterface, r
 	return kvpl, nil
 }
 
-func (c *ipamHandleClient) Watch(ctx context.Context, list model.ListInterface, revision string) (api.WatchInterface, error) {
+func (c *ipamHandleClient) Watch(ctx context.Context, list model.ListInterface, options api.WatchOptions) (api.WatchInterface, error) {
 	log.Warn("Operation Watch is not supported on IPAMHandle type")
 	return nil, cerrors.ErrorOperationNotSupported{
 		Identifier: list,

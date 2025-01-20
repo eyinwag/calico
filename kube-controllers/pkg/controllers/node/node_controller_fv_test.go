@@ -16,21 +16,20 @@ package node_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"reflect"
 	"time"
 
+	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/gomega"
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	"github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
-	"github.com/sirupsen/logrus"
-
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
 	"github.com/projectcalico/calico/felix/fv/containers"
 	"github.com/projectcalico/calico/kube-controllers/tests/testutils"
@@ -39,7 +38,6 @@ import (
 	backend "github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
-	"github.com/projectcalico/calico/libcalico-go/lib/errors"
 	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
 	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
 	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
@@ -228,7 +226,11 @@ var _ = Describe("Calico node controller FV tests (KDD mode)", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			// Release the affinity for the block, creating the desired state - an IP address in a non-affine block.
-			err = calicoClient.IPAM().ReleaseHostAffinities(context.Background(), nodeC, false)
+			affinityCfg := ipam.AffinityConfig{
+				AffinityType: ipam.AffinityTypeHost,
+				Host:         nodeC,
+			}
+			err = calicoClient.IPAM().ReleaseHostAffinities(context.Background(), affinityCfg, false)
 			Expect(err).NotTo(HaveOccurred())
 
 			// Also allocate an IP address on NodeC within NodeB's block, to simulate a "borrowed" address.
@@ -243,13 +245,13 @@ var _ = Describe("Calico node controller FV tests (KDD mode)", func() {
 			blocks, err := bc.List(context.Background(), model.BlockListOptions{}, "")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(len(blocks.KVPairs)).To(Equal(3))
-			affs, err := bc.List(context.Background(), model.BlockAffinityListOptions{Host: nodeA}, "")
+			affs, err := bc.List(context.Background(), model.BlockAffinityListOptions{Host: nodeA, AffinityType: string(ipam.AffinityTypeHost)}, "")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(len(affs.KVPairs)).To(Equal(1))
-			affs, err = bc.List(context.Background(), model.BlockAffinityListOptions{Host: nodeB}, "")
+			affs, err = bc.List(context.Background(), model.BlockAffinityListOptions{Host: nodeB, AffinityType: string(ipam.AffinityTypeHost)}, "")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(len(affs.KVPairs)).To(Equal(1))
-			affs, err = bc.List(context.Background(), model.BlockAffinityListOptions{Host: nodeC}, "")
+			affs, err = bc.List(context.Background(), model.BlockAffinityListOptions{Host: nodeC, AffinityType: string(ipam.AffinityTypeHost)}, "")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(len(affs.KVPairs)).To(Equal(0))
 
@@ -361,7 +363,7 @@ var _ = Describe("Calico node controller FV tests (KDD mode)", func() {
 			blocks, err := bc.List(context.Background(), model.BlockListOptions{}, "")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(len(blocks.KVPairs)).To(Equal(1))
-			affs, err := bc.List(context.Background(), model.BlockAffinityListOptions{Host: nodeA}, "")
+			affs, err := bc.List(context.Background(), model.BlockAffinityListOptions{Host: nodeA, AffinityType: string(ipam.AffinityTypeHost)}, "")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(len(affs.KVPairs)).To(Equal(1))
 
@@ -796,7 +798,8 @@ var _ = Describe("Calico node controller FV tests (etcd mode)", func() {
 			list, err := be.List(
 				context.Background(),
 				model.BlockAffinityListOptions{
-					Host: cNodeName,
+					Host:         cNodeName,
+					AffinityType: string(ipam.AffinityTypeHost),
 				},
 				"",
 			)
@@ -881,7 +884,7 @@ func expectLabels(c client.Interface, labels map[string]string, node string) err
 	if !reflect.DeepEqual(cn.Labels, labels) {
 		s := fmt.Sprintf("Labels do not match.\n\nExpected: %#v\n  Actual: %#v\n", labels, cn.Labels)
 		logrus.Warn(s)
-		return fmt.Errorf(s)
+		return errors.New(s)
 	}
 	return nil
 }
@@ -900,7 +903,7 @@ func assertNumBlocks(bc backend.Client, num int) error {
 func assertIPsWithHandle(c ipam.Interface, handle string, num int) error {
 	ips, err := c.IPsByHandle(context.Background(), handle)
 	if err != nil {
-		if _, ok := err.(errors.ErrorResourceDoesNotExist); !ok {
+		if _, ok := err.(cerrors.ErrorResourceDoesNotExist); !ok {
 			return fmt.Errorf("error querying ips for handle %s: %s", handle, err)
 		}
 	}

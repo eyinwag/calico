@@ -19,7 +19,7 @@ struct name {				\
 	ip_t host_tunnel_ip;		\
 	__be32 flags;			\
 	__be16 wg_port;			\
-	__be16 __pad;			\
+	__be16 profiling;		\
 	__u32 natin_idx;		\
 	__u32 natout_idx;		\
 	__u8 iface_name[16];		\
@@ -52,6 +52,8 @@ enum cali_globals_flags {
 	CALI_GLOBALS_RESERVED7			= 0x00000040,
 	CALI_GLOBALS_NO_DSR_CIDRS		= 0x00000080,
 	CALI_GLOBALS_LO_UDP_ONLY		= 0x00000100,
+	CALI_GLOBALS_RESERVED10			= 0x00000200,
+	CALI_GLOBALS_REDIRECT_PEER		= 0x00000400,
 };
 
 struct cali_ctlb_globals {
@@ -67,6 +69,21 @@ struct cali_xdp_globals {
 struct cali_xdp_preamble_globals {
 	struct cali_xdp_globals v4;
 	struct cali_xdp_globals v6;
+};
+
+struct cali_ct_cleanup_globals {
+    __u64 creation_grace;
+
+    __u64 tcp_syn_sent;
+    __u64 tcp_established;
+    __u64 tcp_fins_seen;
+    __u64 tcp_reset_seen;
+
+    __u64 udp_timeout;
+
+    __u64 generic_timeout;
+
+    __u64 icmp_timeout;
 };
 
 #endif /* __CALI_GLOBALS_H__ */

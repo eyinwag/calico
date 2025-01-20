@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2024 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,35 +19,40 @@ import (
 	"strings"
 
 	log "github.com/sirupsen/logrus"
+	googleproto "google.golang.org/protobuf/proto"
 
 	"github.com/projectcalico/calico/felix/generictables"
 	"github.com/projectcalico/calico/felix/hashutils"
 	"github.com/projectcalico/calico/felix/ipsets"
 	"github.com/projectcalico/calico/felix/iptables"
+	"github.com/projectcalico/calico/felix/nftables"
 	"github.com/projectcalico/calico/felix/proto"
+	"github.com/projectcalico/calico/felix/types"
 )
 
 // ruleRenderer defined in rules_defs.go.
 
-func (r *DefaultRuleRenderer) PolicyToIptablesChains(policyID *proto.PolicyID, policy *proto.Policy, ipVersion uint8) []*generictables.Chain {
+func (r *DefaultRuleRenderer) PolicyToIptablesChains(policyID *types.PolicyID, policy *proto.Policy, ipVersion uint8) []*generictables.Chain {
 	inbound := generictables.Chain{
-		Name:  PolicyChainName(PolicyInboundPfx, policyID),
+		Name: PolicyChainName(PolicyInboundPfx, policyID, r.NFTables),
+		// Note that the policy name includes the tier, so it does not need to be separately specified.
 		Rules: r.ProtoRulesToIptablesRules(policy.InboundRules, ipVersion, fmt.Sprintf("Policy %s ingress", policyID.Name)),
 	}
 	outbound := generictables.Chain{
-		Name:  PolicyChainName(PolicyOutboundPfx, policyID),
+		Name: PolicyChainName(PolicyOutboundPfx, policyID, r.NFTables),
+		// Note that the policy name also includes the tier, so it does not need to be separately specified.
 		Rules: r.ProtoRulesToIptablesRules(policy.OutboundRules, ipVersion, fmt.Sprintf("Policy %s egress", policyID.Name)),
 	}
 	return []*generictables.Chain{&inbound, &outbound}
 }
 
-func (r *DefaultRuleRenderer) ProfileToIptablesChains(profileID *proto.ProfileID, profile *proto.Profile, ipVersion uint8) (inbound, outbound *generictables.Chain) {
+func (r *DefaultRuleRenderer) ProfileToIptablesChains(profileID *types.ProfileID, profile *proto.Profile, ipVersion uint8) (inbound, outbound *generictables.Chain) {
 	inbound = &generictables.Chain{
-		Name:  ProfileChainName(ProfileInboundPfx, profileID),
+		Name:  ProfileChainName(ProfileInboundPfx, profileID, r.NFTables),
 		Rules: r.ProtoRulesToIptablesRules(profile.InboundRules, ipVersion, fmt.Sprintf("Profile %s ingress", profileID.Name)),
 	}
 	outbound = &generictables.Chain{
-		Name:  ProfileChainName(ProfileOutboundPfx, profileID),
+		Name:  ProfileChainName(ProfileOutboundPfx, profileID, r.NFTables),
 		Rules: r.ProtoRulesToIptablesRules(profile.OutboundRules, ipVersion, fmt.Sprintf("Profile %s egress", profileID.Name)),
 	}
 	return
@@ -112,7 +117,7 @@ func FilterRuleToIPVersion(ipVersion uint8, pRule *proto.Rule) *proto.Rule {
 	// rules of the form "allow from 10.0.0.1,feed::beef to 10.0.0.2" will get filtered out,
 	// and only for IPv6, where there's no obvious meaning to the rule.
 
-	ruleCopy := *pRule
+	ruleCopy := googleproto.Clone(pRule).(*proto.Rule)
 	var filteredAll bool
 
 	logCxt := log.WithFields(log.Fields{
@@ -141,7 +146,7 @@ func FilterRuleToIPVersion(ipVersion uint8, pRule *proto.Rule) *proto.Rule {
 	if filteredAll {
 		return nil
 	}
-	return &ruleCopy
+	return ruleCopy
 }
 
 func (r *DefaultRuleRenderer) ProtoRuleToIptablesRules(pRule *proto.Rule, ipVersion uint8) []generictables.Rule {
@@ -195,8 +200,8 @@ func (r *DefaultRuleRenderer) ProtoRuleToIptablesRules(pRule *proto.Rule, ipVers
 	matchBlockBuilder := matchBlockBuilder{
 		actions:           r.ActionFactory,
 		newMatch:          r.NewMatch,
-		markAllBlocksPass: r.IptablesMarkScratch0,
-		markThisBlockPass: r.IptablesMarkScratch1,
+		markAllBlocksPass: r.MarkScratch0,
+		markThisBlockPass: r.MarkScratch1,
 	}
 
 	// Port matches.  We only need to render blocks of ports if, in total, there's more than one
@@ -530,19 +535,19 @@ func (r *DefaultRuleRenderer) CalculateActions(pRule *proto.Rule, ipVersion uint
 	case "", "allow":
 		// Allow needs to set the accept mark, and then return to the calling chain for
 		// further processing.
-		mark = r.IptablesMarkAccept
+		mark = r.MarkAccept
 		actions = append(actions, r.Return())
 	case "next-tier", "pass":
 		// pass (called next-tier in the API for historical reasons) needs to set the pass
 		// mark, and then return to the calling chain for further processing.
-		mark = r.IptablesMarkPass
+		mark = r.MarkPass
 		actions = append(actions, r.Return())
 	case "deny":
 		// Deny maps to DROP/REJECT.
 		actions = append(actions, r.IptablesFilterDenyAction())
 	case "log":
 		// This rule should log.
-		actions = append(actions, r.Log(r.IptablesLogPrefix))
+		actions = append(actions, r.Log(r.LogPrefix))
 	default:
 		log.WithField("action", pRule.Action).Panic("Unknown rule action")
 	}
@@ -795,18 +800,26 @@ func (r *DefaultRuleRenderer) CalculateRuleMatch(pRule *proto.Rule, ipVersion ui
 	return match
 }
 
-func PolicyChainName(prefix PolicyChainNamePrefix, polID *proto.PolicyID) string {
+func PolicyChainName(prefix PolicyChainNamePrefix, polID *types.PolicyID, nft bool) string {
+	maxLen := iptables.MaxChainNameLength
+	if nft {
+		maxLen = nftables.MaxChainNameLength
+	}
 	return hashutils.GetLengthLimitedID(
 		string(prefix),
-		polID.Name,
-		iptables.MaxChainNameLength,
+		polID.Tier+"/"+polID.Name,
+		maxLen,
 	)
 }
 
-func ProfileChainName(prefix ProfileChainNamePrefix, profID *proto.ProfileID) string {
+func ProfileChainName(prefix ProfileChainNamePrefix, profID *types.ProfileID, nft bool) string {
+	maxLen := iptables.MaxChainNameLength
+	if nft {
+		maxLen = nftables.MaxChainNameLength
+	}
 	return hashutils.GetLengthLimitedID(
 		string(prefix),
 		profID.Name,
-		iptables.MaxChainNameLength,
+		maxLen,
 	)
 }

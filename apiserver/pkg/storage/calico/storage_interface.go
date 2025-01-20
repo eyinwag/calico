@@ -1,22 +1,24 @@
-// Copyright (c) 2019-2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2024 Tigera, Inc. All rights reserved.
 
 package calico
 
 import (
+	"github.com/sirupsen/logrus"
 	"k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/storage/storagebackend/factory"
-	"k8s.io/klog/v2"
 )
 
 // NewStorage creates a new libcalico-based storage.Interface implementation
 func NewStorage(opts Options) (registry.DryRunnableStorage, factory.DestroyFunc) {
-	klog.V(4).Infoln("Constructing Calico Storage")
+	logrus.Debug("Constructing Calico Storage")
 
 	switch opts.RESTOptions.ResourcePrefix {
 	case "projectcalico.org/networkpolicies":
 		return NewNetworkPolicyStorage(opts)
 	case "projectcalico.org/globalnetworkpolicies":
 		return NewGlobalNetworkPolicyStorage(opts)
+	case "projectcalico.org/tiers":
+		return NewTierStorage(opts)
 	case "projectcalico.org/globalnetworksets":
 		return NewGlobalNetworkSetStorage(opts)
 	case "projectcalico.org/networksets":
@@ -48,7 +50,7 @@ func NewStorage(opts Options) (registry.DryRunnableStorage, factory.DestroyFunc)
 	case "projectcalico.org/blockaffinities":
 		return NewBlockAffinityStorage(opts)
 	default:
-		klog.Fatalf("Unable to create storage for resource %v", opts.RESTOptions.ResourcePrefix)
+		logrus.Fatalf("Unable to create storage for resource %v", opts.RESTOptions.ResourcePrefix)
 		return registry.DryRunnableStorage{}, nil
 	}
 }

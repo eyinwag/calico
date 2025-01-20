@@ -51,11 +51,10 @@ import (
 	"github.com/projectcalico/calico/felix/bpf/maps"
 	"github.com/projectcalico/calico/felix/bpf/nat"
 	"github.com/projectcalico/calico/felix/bpf/polprog"
+	"github.com/projectcalico/calico/felix/bpf/profiling"
 	"github.com/projectcalico/calico/felix/bpf/routes"
 	"github.com/projectcalico/calico/felix/bpf/state"
-	"github.com/projectcalico/calico/felix/bpf/tc"
 	tcdefs "github.com/projectcalico/calico/felix/bpf/tc/defs"
-	"github.com/projectcalico/calico/felix/bpf/xdp"
 	"github.com/projectcalico/calico/felix/environment"
 	"github.com/projectcalico/calico/felix/idalloc"
 	"github.com/projectcalico/calico/felix/ip"
@@ -372,13 +371,11 @@ func setupAndRun(logger testLogger, loglevel, section string, rules *polprog.Rul
 
 	if topts.objname != "" {
 		obj = topts.objname
-	} else if topts.ipv6 {
-		if topts.xdp {
-			obj += "_co-re_v6"
-		} else {
+	} else {
+		obj += "_co-re"
+		if topts.ipv6 {
 			obj += "_v6"
 		}
-
 	}
 
 	if topts.xdp {
@@ -578,6 +575,7 @@ var (
 	natMap, natBEMap, ctMap, rtMap, ipsMap, testStateMap, affinityMap, arpMap, fsafeMap     maps.Map
 	natMapV6, natBEMapV6, ctMapV6, rtMapV6, ipsMapV6, affinityMapV6, arpMapV6, fsafeMapV6   maps.Map
 	stateMap, countersMap, ifstateMap, progMap, progMapXDP, policyJumpMap, policyJumpMapXDP maps.Map
+	profilingMap                                                                            maps.Map
 	allMaps                                                                                 []maps.Map
 )
 
@@ -605,10 +603,11 @@ func initMapsOnce() {
 		ifstateMap = ifstate.Map()
 		policyJumpMap = jump.Map()
 		policyJumpMapXDP = jump.XDPMap()
+		profilingMap = profiling.Map()
 
 		allMaps = []maps.Map{natMap, natBEMap, natMapV6, natBEMapV6, ctMap, ctMapV6, rtMap, rtMapV6, ipsMap, ipsMapV6,
 			stateMap, testStateMap, affinityMap, affinityMapV6, arpMap, arpMapV6, fsafeMap, fsafeMapV6,
-			countersMap, ifstateMap,
+			countersMap, ifstateMap, profilingMap,
 			policyJumpMap, policyJumpMapXDP}
 		for _, m := range allMaps {
 			err := m.EnsureExists()
@@ -750,34 +749,10 @@ func objLoad(fname, bpfFsDir, ipFamily string, topts testOpts, polProg, hasHostC
 					}
 				}
 
-				if err := xdp.ConfigureProgram(m, bpfIfaceName, &globals); err != nil {
-					return nil, err
+				globals.IfaceName = setLogPrefix(bpfIfaceName)
+				if err := globals.Set(m); err != nil {
+					return nil, fmt.Errorf("failed to configure xdp program: %w", err)
 				}
-			} else if topts.ipv6 {
-				ifaceLog := topts.progLog + "-" + bpfIfaceName
-				globals := libbpf.TcGlobalData{
-					Tmtu:         natTunnelMTU,
-					VxlanPort:    testVxlanPort,
-					PSNatStart:   uint16(topts.psnaStart),
-					PSNatLen:     uint16(topts.psnatEnd-topts.psnaStart) + 1,
-					Flags:        libbpf.GlobalsNoDSRCidrs | libbpf.GlobalsRPFOptionStrict,
-					LogFilterJmp: 0xffffffff,
-				}
-
-				copy(globals.HostTunnelIPv6[:], node1tunIPV6.To16())
-				copy(globals.HostIPv6[:], hostIP.To16())
-				copy(globals.IntfIPv6[:], intfIPV6.To16())
-
-				for i := 0; i < tcdefs.ProgIndexEnd; i++ {
-					globals.JumpsV6[i] = uint32(i)
-				}
-
-				log.WithField("globals", globals).Debugf("configure program v6")
-
-				if err := tc.ConfigureProgram(m, ifaceLog, &globals); err != nil {
-					return nil, fmt.Errorf("failed to configure tc program: %w", err)
-				}
-				log.WithField("program", fname).Debugf("Configured BPF program iface \"%s\"", ifaceLog)
 			} else {
 				ifaceLog := topts.progLog + "-" + bpfIfaceName
 				globals := libbpf.TcGlobalData{
@@ -787,19 +762,29 @@ func objLoad(fname, bpfFsDir, ipFamily string, topts testOpts, polProg, hasHostC
 					PSNatLen:     uint16(topts.psnatEnd-topts.psnaStart) + 1,
 					Flags:        libbpf.GlobalsNoDSRCidrs,
 					LogFilterJmp: 0xffffffff,
+					IfaceName:    setLogPrefix(ifaceLog),
 				}
+				if topts.ipv6 {
+					copy(globals.HostTunnelIPv6[:], node1tunIPV6.To16())
+					copy(globals.HostIPv6[:], hostIP.To16())
+					copy(globals.IntfIPv6[:], intfIPV6.To16())
 
-				copy(globals.HostIPv4[0:4], hostIP)
-				copy(globals.IntfIPv4[0:4], intfIP)
-				copy(globals.HostTunnelIPv4[0:4], node1tunIP.To4())
+					for i := 0; i < tcdefs.ProgIndexEnd; i++ {
+						globals.JumpsV6[i] = uint32(i)
+					}
+					globals.Flags |= libbpf.GlobalsRPFOptionStrict
+					log.WithField("globals", globals).Debugf("configure program v6")
+				} else {
+					copy(globals.HostIPv4[0:4], hostIP)
+					copy(globals.IntfIPv4[0:4], intfIP)
+					copy(globals.HostTunnelIPv4[0:4], node1tunIP.To4())
 
-				for i := 0; i < tcdefs.ProgIndexEnd; i++ {
-					globals.Jumps[i] = uint32(i)
+					for i := 0; i < tcdefs.ProgIndexEnd; i++ {
+						globals.Jumps[i] = uint32(i)
+					}
+					log.WithField("globals", globals).Debugf("configure program")
 				}
-
-				log.WithField("globals", globals).Debugf("configure program")
-
-				if err := tc.ConfigureProgram(m, ifaceLog, &globals); err != nil {
+				if err := globals.Set(m); err != nil {
 					return nil, fmt.Errorf("failed to configure tc program: %w", err)
 				}
 				log.WithField("program", fname).Debugf("Configured BPF program iface \"%s\"", ifaceLog)
@@ -891,38 +876,25 @@ func objUTLoad(fname, bpfFsDir, ipFamily string, topts testOpts, polProg, hasHos
 
 	for m, err := obj.FirstMap(); m != nil && err == nil; m, err = m.NextMap() {
 		if m.IsMapInternal() {
-			ifaceLog := topts.progLog + "-" + bpfIfaceName
+			globals := libbpf.TcGlobalData{
+				Tmtu:       natTunnelMTU,
+				VxlanPort:  testVxlanPort,
+				PSNatStart: uint16(topts.psnaStart),
+				PSNatLen:   uint16(topts.psnatEnd-topts.psnaStart) + 1,
+				Flags:      libbpf.GlobalsNoDSRCidrs,
+				IfaceName:  setLogPrefix(topts.progLog + "-" + bpfIfaceName),
+			}
 			if topts.ipv6 {
-				globals := libbpf.TcGlobalData{
-					Tmtu:       natTunnelMTU,
-					VxlanPort:  testVxlanPort,
-					PSNatStart: uint16(topts.psnaStart),
-					PSNatLen:   uint16(topts.psnatEnd-topts.psnaStart) + 1,
-					Flags:      libbpf.GlobalsNoDSRCidrs,
-				}
-
 				copy(globals.HostTunnelIPv6[:], node1tunIPV6.To16())
 				copy(globals.HostIPv6[:], hostIP.To16())
 				copy(globals.IntfIPv6[:], intfIPV6.To16())
-
-				if err := tc.ConfigureProgram(m, ifaceLog, &globals); err != nil {
-					return nil, fmt.Errorf("failed to configure v6 tc program: %w", err)
-				}
 			} else {
-				globals := libbpf.TcGlobalData{
-					Tmtu:       natTunnelMTU,
-					VxlanPort:  testVxlanPort,
-					PSNatStart: uint16(topts.psnaStart),
-					PSNatLen:   uint16(topts.psnatEnd-topts.psnaStart) + 1,
-					Flags:      libbpf.GlobalsNoDSRCidrs,
-				}
 				copy(globals.HostTunnelIPv4[0:4], node1tunIP.To4())
 				copy(globals.HostIPv4[0:4], hostIP.To4())
 				copy(globals.IntfIPv4[0:4], intfIP.To4())
-
-				if err := tc.ConfigureProgram(m, ifaceLog, &globals); err != nil {
-					return nil, fmt.Errorf("failed to configure tc program: %w", err)
-				}
+			}
+			if err := globals.Set(m); err != nil {
+				return nil, fmt.Errorf("failed to configure tc program: %w", err)
 			}
 			break
 		}
@@ -954,6 +926,12 @@ func xdpUpdateJumpMap(obj *libbpf.Obj, progs map[int]string) error {
 	}
 
 	return nil
+}
+
+func setLogPrefix(ifaceLog string) string {
+	in := []byte("---------------")
+	copy(in, ifaceLog)
+	return string(in)
 }
 
 type bpfRunResult struct {
@@ -997,12 +975,12 @@ func bpftoolProgRunN(progName string, dataIn, ctxIn []byte, N int) (bpfRunResult
 	ctxOutFname := tempDir + "/ctx_out"
 
 	if err := os.WriteFile(dataInFname, dataIn, 0644); err != nil {
-		return res, errors.Errorf("failed to write input data in file: %s", err)
+		return res, fmt.Errorf("failed to write input data in file: %s", err)
 	}
 
 	if ctxIn != nil {
 		if err := os.WriteFile(ctxInFname, ctxIn, 0644); err != nil {
-			return res, errors.Errorf("failed to write input ctx in file: %s", err)
+			return res, fmt.Errorf("failed to write input ctx in file: %s", err)
 		}
 	}
 
@@ -1020,18 +998,18 @@ func bpftoolProgRunN(progName string, dataIn, ctxIn []byte, N int) (bpfRunResult
 	}
 
 	if err := json.Unmarshal(out, &res); err != nil {
-		return res, errors.Errorf("failed to unmarshall json: %s", err)
+		return res, fmt.Errorf("failed to unmarshall json: %s", err)
 	}
 
 	res.dataOut, err = os.ReadFile(dataOutFname)
 	if err != nil {
-		return res, errors.Errorf("failed to read output data from file: %s", err)
+		return res, fmt.Errorf("failed to read output data from file: %s", err)
 	}
 
 	if ctxIn != nil {
 		ctxOut, err := os.ReadFile(ctxOutFname)
 		if err != nil {
-			return res, errors.Errorf("failed to read output ctx from file: %s", err)
+			return res, fmt.Errorf("failed to read output ctx from file: %s", err)
 		}
 		skbMark = binary.LittleEndian.Uint32(ctxOut[2*4 : 3*4])
 	}
@@ -1614,7 +1592,7 @@ func (pkt *Packet) handleL4() error {
 		pkt.l4Protocol = layers.IPProtocolICMPv6
 		pkt.layers = append(pkt.layers, pkt.icmpv6)
 	default:
-		return errors.Errorf("unrecognized l4 layer type %t", pkt.l4)
+		return fmt.Errorf("unrecognized l4 layer type %t", pkt.l4)
 	}
 	return nil
 }
@@ -1705,7 +1683,7 @@ func (pkt *Packet) handleL3() error {
 		pkt.ipv6.Length = uint16(pkt.length)
 		pkt.layers = append(pkt.layers, pkt.ipv6)
 	default:
-		return errors.Errorf("unrecognized l3 layer type %t", pkt.l3)
+		return fmt.Errorf("unrecognized l3 layer type %t", pkt.l3)
 	}
 	return nil
 }

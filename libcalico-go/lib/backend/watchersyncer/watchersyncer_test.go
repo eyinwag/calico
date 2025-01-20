@@ -31,6 +31,7 @@ import (
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/watchersyncer"
 	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
+	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
 	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
 	"github.com/projectcalico/calico/libcalico-go/lib/testutils"
 )
@@ -66,8 +67,9 @@ var (
 		Name: "ippool-2",
 	}
 	l3Key1 = model.BlockAffinityKey{
-		CIDR: cnet.MustParseCIDR("1.2.3.0/24"),
-		Host: "mynode",
+		CIDR:         cnet.MustParseCIDR("1.2.3.0/24"),
+		Host:         "mynode",
+		AffinityType: string(ipam.AffinityTypeHost),
 	}
 	emptyList = &model.KVPairList{
 		Revision: "abcdef12345",
@@ -1012,47 +1014,38 @@ func (c *fakeClient) getLatestWatchRevision() string {
 // a fake watcher that the test code will drive.
 func (c *fakeClient) Create(ctx context.Context, object *model.KVPair) (*model.KVPair, error) {
 	panic("should not be called")
-	return nil, nil
 }
 
 func (c *fakeClient) Update(ctx context.Context, object *model.KVPair) (*model.KVPair, error) {
 	panic("should not be called")
-	return nil, nil
 }
 
 func (c *fakeClient) Apply(ctx context.Context, object *model.KVPair) (*model.KVPair, error) {
 	panic("should not be called")
-	return nil, nil
 }
 
 func (c *fakeClient) DeleteKVP(ctx context.Context, kvp *model.KVPair) (*model.KVPair, error) {
 	panic("should not be called")
-	return nil, nil
 }
 
 func (c *fakeClient) Delete(ctx context.Context, key model.Key, revision string) (*model.KVPair, error) {
 	panic("should not be called")
-	return nil, nil
 }
 
 func (c *fakeClient) Get(ctx context.Context, key model.Key, revision string) (*model.KVPair, error) {
 	panic("should not be called")
-	return nil, nil
 }
 
 func (c *fakeClient) Syncer(callbacks api.SyncerCallbacks) api.Syncer {
 	panic("should not be called")
-	return nil
 }
 
 func (c *fakeClient) EnsureInitialized() error {
 	panic("should not be called")
-	return nil
 }
 
 func (c *fakeClient) Clean() error {
 	panic("should not be called")
-	return nil
 }
 
 func (c *fakeClient) List(ctx context.Context, list model.ListInterface, revision string) (*model.KVPairList, error) {
@@ -1067,14 +1060,14 @@ func (c *fakeClient) List(ctx context.Context, list model.ListInterface, revisio
 	}
 }
 
-func (c *fakeClient) Watch(ctx context.Context, list model.ListInterface, revision string) (api.WatchInterface, error) {
+func (c *fakeClient) Watch(ctx context.Context, list model.ListInterface, options api.WatchOptions) (api.WatchInterface, error) {
 	// Create a fake watcher keyed off the ListOptions (root path).
 	name := model.ListOptionsToDefaultPathRoot(list)
 	log.WithField("Name", name).Info("Watch request")
 	if l, ok := c.lws[name]; !ok || l == nil {
 		panic("Watch for unhandled resource type")
 	} else {
-		c.latestWatchRevision = revision
+		c.latestWatchRevision = options.Revision
 		return l.watch()
 	}
 }

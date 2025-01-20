@@ -1,4 +1,4 @@
-// Copyright (c) 2017, 2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2024 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,20 +20,8 @@ import (
 	"strings"
 	"time"
 
-	log "github.com/sirupsen/logrus"
-
-	rcache "github.com/projectcalico/calico/kube-controllers/pkg/cache"
-	"github.com/projectcalico/calico/kube-controllers/pkg/config"
-	"github.com/projectcalico/calico/kube-controllers/pkg/controllers/controller"
-
 	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
-	"github.com/projectcalico/calico/kube-controllers/pkg/converter"
-	kdd "github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
-	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
-	"github.com/projectcalico/calico/libcalico-go/lib/errors"
-	"github.com/projectcalico/calico/libcalico-go/lib/options"
-
+	log "github.com/sirupsen/logrus"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -41,6 +29,15 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+
+	rcache "github.com/projectcalico/calico/kube-controllers/pkg/cache"
+	"github.com/projectcalico/calico/kube-controllers/pkg/config"
+	"github.com/projectcalico/calico/kube-controllers/pkg/controllers/controller"
+	"github.com/projectcalico/calico/kube-controllers/pkg/converter"
+	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
+	"github.com/projectcalico/calico/libcalico-go/lib/errors"
+	"github.com/projectcalico/calico/libcalico-go/lib/names"
+	"github.com/projectcalico/calico/libcalico-go/lib/options"
 )
 
 // policyController implements the Controller interface for managing Kubernetes network policies
@@ -72,7 +69,7 @@ func NewPolicyController(ctx context.Context, clientset *kubernetes.Clientset, c
 		// Filter in only objects that are written by policy controller.
 		m := make(map[string]interface{})
 		for _, policy := range calicoPolicies.Items {
-			if strings.HasPrefix(policy.Name, kdd.K8sNetworkPolicyNamePrefix) {
+			if strings.HasPrefix(policy.Name, names.K8sNetworkPolicyNamePrefix) {
 				// Update the network policy's ObjectMeta so that it simply contains the name and namespace.
 				// There is other metadata that we might receive (like resource version) that we don't want to
 				// compare in the cache.
@@ -94,45 +91,51 @@ func NewPolicyController(ctx context.Context, clientset *kubernetes.Clientset, c
 
 	// Bind the Calico cache to kubernetes cache with the help of an informer. This way we make sure that
 	// whenever the kubernetes cache is updated, changes get reflected in the Calico cache as well.
-	_, informer := cache.NewIndexerInformer(listWatcher, &networkingv1.NetworkPolicy{}, 0, cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			log.Debugf("Got ADD event for network policy: %#v", obj)
-			policy, err := policyConverter.Convert(obj)
-			if err != nil {
-				log.WithError(err).Errorf("Error while converting %#v to calico network policy.", obj)
-				return
-			}
+	_, informer := cache.NewInformerWithOptions(cache.InformerOptions{
+		ListerWatcher: listWatcher,
+		ObjectType:    &networkingv1.NetworkPolicy{},
+		ResyncPeriod:  0,
+		Handler: cache.ResourceEventHandlerFuncs{
+			AddFunc: func(obj interface{}) {
+				log.Debugf("Got ADD event for network policy: %#v", obj)
+				policy, err := policyConverter.Convert(obj)
+				if err != nil {
+					log.WithError(err).Errorf("Error while converting %#v to calico network policy.", obj)
+					return
+				}
 
-			// Add to cache.
-			k := policyConverter.GetKey(policy)
-			ccache.Set(k, policy)
-		},
-		UpdateFunc: func(oldObj interface{}, newObj interface{}) {
-			log.Debugf("Got UPDATE event for NetworkPolicy.")
-			log.Debugf("Old object: \n%#v\n", oldObj)
-			log.Debugf("New object: \n%#v\n", newObj)
-			policy, err := policyConverter.Convert(newObj)
-			if err != nil {
-				log.WithError(err).Errorf("Error converting to Calico policy.")
-				return
-			}
+				// Add to cache.
+				k := policyConverter.GetKey(policy)
+				ccache.Set(k, policy)
+			},
+			UpdateFunc: func(oldObj interface{}, newObj interface{}) {
+				log.Debugf("Got UPDATE event for NetworkPolicy.")
+				log.Debugf("Old object: \n%#v\n", oldObj)
+				log.Debugf("New object: \n%#v\n", newObj)
+				policy, err := policyConverter.Convert(newObj)
+				if err != nil {
+					log.WithError(err).Errorf("Error converting to Calico policy.")
+					return
+				}
 
-			// Add to cache.
-			k := policyConverter.GetKey(policy)
-			ccache.Set(k, policy)
-		},
-		DeleteFunc: func(obj interface{}) {
-			log.Debugf("Got DELETE event for NetworkPolicy: %#v", obj)
-			policy, err := policyConverter.Convert(obj)
-			if err != nil {
-				log.WithError(err).Errorf("Error converting to Calico policy.")
-				return
-			}
+				// Add to cache.
+				k := policyConverter.GetKey(policy)
+				ccache.Set(k, policy)
+			},
+			DeleteFunc: func(obj interface{}) {
+				log.Debugf("Got DELETE event for NetworkPolicy: %#v", obj)
+				policy, err := policyConverter.Convert(obj)
+				if err != nil {
+					log.WithError(err).Errorf("Error converting to Calico policy.")
+					return
+				}
 
-			calicoKey := policyConverter.GetKey(policy)
-			ccache.Delete(calicoKey)
+				calicoKey := policyConverter.GetKey(policy)
+				ccache.Delete(calicoKey)
+			},
 		},
-	}, cache.Indexers{})
+		Indexers: cache.Indexers{},
+	})
 
 	return &policyController{informer, ccache, c, ctx, cfg}
 }

@@ -1,4 +1,4 @@
-// Copyright (c) 2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2024 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,13 +17,13 @@ package rest
 import (
 	"fmt"
 
+	calico "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/registry/rest"
 
-	calico "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
+	"github.com/projectcalico/calico/apiserver/pkg/rbac"
 	calicobgpconfiguration "github.com/projectcalico/calico/apiserver/pkg/registry/projectcalico/bgpconfiguration"
 	calicobgpfilter "github.com/projectcalico/calico/apiserver/pkg/registry/projectcalico/bgpfilter"
 	calicobgppeer "github.com/projectcalico/calico/apiserver/pkg/registry/projectcalico/bgppeer"
@@ -42,6 +42,7 @@ import (
 	caliconetworkset "github.com/projectcalico/calico/apiserver/pkg/registry/projectcalico/networkset"
 	calicoprofile "github.com/projectcalico/calico/apiserver/pkg/registry/projectcalico/profile"
 	"github.com/projectcalico/calico/apiserver/pkg/registry/projectcalico/server"
+	calicotier "github.com/projectcalico/calico/apiserver/pkg/registry/projectcalico/tier"
 	calicostorage "github.com/projectcalico/calico/apiserver/pkg/storage/calico"
 	"github.com/projectcalico/calico/apiserver/pkg/storage/etcd"
 )
@@ -57,8 +58,9 @@ func (p RESTStorageProvider) NewV3Storage(
 	scheme *runtime.Scheme,
 	restOptionsGetter generic.RESTOptionsGetter,
 	authorizer authorizer.Authorizer,
+	calicoLister rbac.CalicoResourceLister,
 ) (map[string]rest.Storage, error) {
-	policyRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("networkpolicies"))
+	policyRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("networkpolicies"), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -80,7 +82,7 @@ func (p RESTStorageProvider) NewV3Storage(
 		[]string{"cnp", "caliconetworkpolicy", "caliconetworkpolicies"},
 	)
 
-	networksetRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("networksets"))
+	networksetRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("networksets"), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -102,7 +104,29 @@ func (p RESTStorageProvider) NewV3Storage(
 		[]string{"netsets"},
 	)
 
-	gpolicyRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("globalnetworkpolicies"))
+	tierRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("tiers"), nil)
+	if err != nil {
+		return nil, err
+	}
+	tierOpts := server.NewOptions(
+		etcd.Options{
+			RESTOptions:   tierRESTOptions,
+			Capacity:      1000,
+			ObjectType:    calicotier.EmptyObject(),
+			ScopeStrategy: calicotier.NewStrategy(scheme),
+			NewListFunc:   calicotier.NewList,
+			GetAttrsFunc:  calicotier.GetAttrs,
+			Trigger:       nil,
+		},
+		calicostorage.Options{
+			RESTOptions: tierRESTOptions,
+		},
+		p.StorageType,
+		authorizer,
+		[]string{},
+	)
+
+	gpolicyRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("globalnetworkpolicies"), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -124,7 +148,7 @@ func (p RESTStorageProvider) NewV3Storage(
 		[]string{"gnp", "cgnp", "calicoglobalnetworkpolicies"},
 	)
 
-	gNetworkSetRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("globalnetworksets"))
+	gNetworkSetRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("globalnetworksets"), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +170,7 @@ func (p RESTStorageProvider) NewV3Storage(
 		[]string{},
 	)
 
-	hostEndpointRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("hostendpoints"))
+	hostEndpointRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("hostendpoints"), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +192,7 @@ func (p RESTStorageProvider) NewV3Storage(
 		[]string{"hep", "heps"},
 	)
 
-	ipPoolRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("ippools"))
+	ipPoolRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("ippools"), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -190,7 +214,7 @@ func (p RESTStorageProvider) NewV3Storage(
 		[]string{},
 	)
 
-	ipReservationRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("ipreservations"))
+	ipReservationRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("ipreservations"), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -212,7 +236,7 @@ func (p RESTStorageProvider) NewV3Storage(
 		[]string{},
 	)
 
-	bgpConfigurationRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("bgpconfigurations"))
+	bgpConfigurationRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("bgpconfigurations"), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -234,7 +258,7 @@ func (p RESTStorageProvider) NewV3Storage(
 		[]string{"bgpconfig", "bgpconfigs"},
 	)
 
-	bgpPeerRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("bgppeers"))
+	bgpPeerRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("bgppeers"), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -256,7 +280,7 @@ func (p RESTStorageProvider) NewV3Storage(
 		[]string{},
 	)
 
-	bgpFilterRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("bgpfilters"))
+	bgpFilterRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("bgpfilters"), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -278,7 +302,7 @@ func (p RESTStorageProvider) NewV3Storage(
 		[]string{},
 	)
 
-	profileRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("profiles"))
+	profileRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("profiles"), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -300,7 +324,7 @@ func (p RESTStorageProvider) NewV3Storage(
 		[]string{},
 	)
 
-	felixConfigRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("felixconfigurations"))
+	felixConfigRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("felixconfigurations"), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -322,7 +346,7 @@ func (p RESTStorageProvider) NewV3Storage(
 		[]string{"felixconfig", "felixconfigs"},
 	)
 
-	kubeControllersConfigsRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("kubecontrollersconfigurations"))
+	kubeControllersConfigsRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("kubecontrollersconfigurations"), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -344,7 +368,7 @@ func (p RESTStorageProvider) NewV3Storage(
 		[]string{"kcconfig"},
 	)
 
-	clusterInformationRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("clusterinformations"))
+	clusterInformationRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("clusterinformations"), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -366,7 +390,7 @@ func (p RESTStorageProvider) NewV3Storage(
 		[]string{"clusterinfo"},
 	)
 
-	caliconodestatusRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("caliconodestatuses"))
+	caliconodestatusRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("caliconodestatuses"), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -388,7 +412,7 @@ func (p RESTStorageProvider) NewV3Storage(
 		[]string{"caliconodestatus"},
 	)
 
-	ipamconfigRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("ipamconfigurations"))
+	ipamconfigRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("ipamconfigurations"), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -410,7 +434,7 @@ func (p RESTStorageProvider) NewV3Storage(
 		[]string{"ipamconfig"},
 	)
 
-	blockAffinityRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("blockaffinities"))
+	blockAffinityRESTOptions, err := restOptionsGetter.GetRESTOptions(calico.Resource("blockaffinities"), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -433,8 +457,9 @@ func (p RESTStorageProvider) NewV3Storage(
 	)
 
 	storage := map[string]rest.Storage{}
-	storage["networkpolicies"] = rESTInPeace(calicopolicy.NewREST(scheme, *policyOpts))
-	storage["globalnetworkpolicies"] = rESTInPeace(calicogpolicy.NewREST(scheme, *gpolicyOpts))
+	storage["tiers"] = rESTInPeace(calicotier.NewREST(scheme, *tierOpts))
+	storage["networkpolicies"] = rESTInPeace(calicopolicy.NewREST(scheme, *policyOpts, calicoLister))
+	storage["globalnetworkpolicies"] = rESTInPeace(calicogpolicy.NewREST(scheme, *gpolicyOpts, calicoLister))
 	storage["globalnetworksets"] = rESTInPeace(calicognetworkset.NewREST(scheme, *gNetworkSetOpts))
 	storage["networksets"] = rESTInPeace(caliconetworkset.NewREST(scheme, *networksetOpts))
 	storage["hostendpoints"] = rESTInPeace(calicohostendpoint.NewREST(scheme, *hostEndpointOpts))

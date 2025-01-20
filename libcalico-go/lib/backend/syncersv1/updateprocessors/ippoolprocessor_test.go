@@ -17,10 +17,8 @@ package updateprocessors_test
 import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/encap"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
@@ -70,6 +68,7 @@ var _ = Describe("Test the IPPool update processor", func() {
 				IPAM:             true,
 				Disabled:         false,
 				DisableBGPExport: false,
+				AssignmentMode:   apiv3.Automatic,
 			},
 			Revision: "abcde",
 		}))
@@ -110,6 +109,7 @@ var _ = Describe("Test the IPPool update processor", func() {
 					IPAM:             false,
 					Disabled:         true,
 					DisableBGPExport: false,
+					AssignmentMode:   apiv3.Automatic,
 				},
 				Revision: "1234",
 			},
@@ -123,6 +123,7 @@ var _ = Describe("Test the IPPool update processor", func() {
 					IPAM:             true,
 					Disabled:         false,
 					DisableBGPExport: false,
+					AssignmentMode:   apiv3.Automatic,
 				},
 				Revision: "abcdef",
 			},
@@ -150,6 +151,7 @@ var _ = Describe("Test the IPPool update processor", func() {
 					IPAM:             true,
 					Disabled:         false,
 					DisableBGPExport: true,
+					AssignmentMode:   apiv3.Automatic,
 				},
 				Revision: "abcdefg",
 			},
@@ -207,6 +209,7 @@ var _ = Describe("Test the IPPool update processor", func() {
 				Disabled:         false,
 				DisableBGPExport: false,
 				VXLANMode:        encap.CrossSubnet,
+				AssignmentMode:   apiv3.Automatic,
 			},
 			Revision: "abcde",
 		}))

@@ -5,12 +5,16 @@
 # Disable implicit rules.
 .SUFFIXES:
 
+LIBBPF_DIR=libbpf
+LIBBPF_FILE_CREATED=.libbpf-$(LIBBPF_VERSION)
+
 # C flags for compiling BPF programs. "-target bpf" enables some workarounds
 # for BPF programs and makes inline assembly aware of the BPF registers.
 CFLAGS +=  \
 	-Wall \
 	-Werror \
 	-fno-stack-protector \
+	-Wno-address-of-packed-member \
 	-O2 \
 	-target bpf \
 	-emit-llvm \
@@ -34,8 +38,8 @@ CFLAGS +=  \
 # That's tricky because go-build is based on the upstream images
 # from the go team, and they don't provide anything newer.
 CFLAGS +=  \
-	-I ./include/libbpf/src/ \
-	-I ./include/libbpf/include/uapi
+	-I ./libbpf/src/ \
+	-I ./libbpf/include/uapi
 
 # Workaround for Debian placing "asm/types.h" in /usr/include/x86_64-linux-gnu
 # We also pick up a couple of other definitions from here, such as the socket
@@ -48,7 +52,7 @@ ifeq ($(findstring x86_64,$(TRIPLET)),x86_64)
 else ifeq ($(findstring aarch64,$(TRIPLET)),aarch64)
 	CFLAGS += -D__TARGET_ARCH_arm64
 endif
-CC := clang-17
+CC := clang
 LD := llc
 
 UT_C_FILES:=$(shell find ut -name '*.c')
@@ -64,19 +68,27 @@ C_FILES:=tc_preamble.c tc.c connect_balancer.c connect_balancer_v46.c connect_ba
 all: $(OBJS)
 ut-objs: $(UT_OBJS)
 
+libbpf: $(LIBBPF_FILE_CREATED)
+$(LIBBPF_FILE_CREATED):	
+ifeq ("$(wildcard ./$(LIBBPF_DIR))", "")
+	$(info "Directory does not exist.")
+	@echo "Directory does not exist."
+	git clone --depth 1 --single-branch https://github.com/libbpf/libbpf.git
+endif
+	rm -rf .libbpf-*
+	cd $(LIBBPF_DIR) && \
+		git fetch --tags && git checkout $(LIBBPF_VERSION)
+	touch $(LIBBPF_FILE_CREATED)
+
+
 COMPILE=$(CC) $(CFLAGS) `./calculate-flags $@` -c $< -o $@
-connect_time_%v4.ll: connect_balancer.c connect_balancer.d calculate-flags
-	$(COMPILE)
-connect_time_%v46.ll: connect_balancer_v46.c connect_balancer_v46.d calculate-flags
-	$(COMPILE)
-connect_time_%v6.ll: connect_balancer_v6.c connect_balancer_v6.d calculate-flags
-	$(COMPILE) -DIPVER6
 
 UT_CFLAGS=\
 	-D__BPFTOOL_LOADER__ \
 	-DCALI_LOG_LEVEL=CALI_LOG_LEVEL_DEBUG \
 	-DUNITTEST \
 	-DCALI_LOG_PFX=UNITTEST \
+	-DBPF_CORE_SUPPORTED	\
 	-I .
 
 # Mini-UT programs that test one or two functions.  These are each in their own files.
@@ -96,26 +108,32 @@ policy_default.ll: policy_default.c policy_default.d
 
 # Production and UT versions of the main binaries.
 # Combining the targets into one rule causes make to fail to rebuild the .ll files.  Not sure why.
+to%_v6.ll: tc.c tc_v6.d calculate-flags
+	$(COMPILE)
 to%.ll: tc.c tc.d calculate-flags
 	$(COMPILE)
 from%.ll: tc.c tc.d calculate-flags
 	$(COMPILE)
-to%_v6.ll: tc.c tc.d calculate-flags
-	$(COMPILE)
-from%_v6.ll: tc.c tc.d calculate-flags
+from%_v6.ll: tc.c tc_v6.d calculate-flags
 	$(COMPILE)
 test%.ll: tc.c tc.d calculate-flags
 	$(COMPILE)
-test%_v6.ll: tc.c tc.d calculate-flags
+test%_v6.ll: tc.c tc_v6.d calculate-flags
 	$(COMPILE)
 xdp%.ll: xdp.c xdp.d calculate-flags
 	$(COMPILE)
-xdp%_v6.ll: xdp.c xdp.d calculate-flags
+xdp%_v6.ll: xdp.c xdp_v6.d calculate-flags
 	$(COMPILE)
 test_xdp%.ll: xdp.c xdp.d calculate-flags
 	$(COMPILE)
-test_xdp%_v6.ll: xdp.c xdp.d calculate-flags
+test_xdp%_v6.ll: xdp.c xdp_v6.d calculate-flags
 	$(COMPILE)
+
+tc_v6.d: tc.c
+	$(COMPILE_DEPS)
+xdp_v6.d: xdp.c
+	$(COMPILE_DEPS)
+
 
 LINK=$(LD) -march=bpf -filetype=obj -o $@ $<
 bin/tc_preamble.o: tc_preamble.ll | bin
@@ -132,18 +150,6 @@ bin/test%.o: test%.ll | bin
 	$(LINK)
 bin/xdp%.o: xdp%.ll | bin
 	$(LINK)
-bin/connect_time_%v4.o: connect_time_%v4.ll | bin
-	$(LINK)
-bin/connect_time_%v46.o: connect_time_%v46.ll | bin
-	$(LINK)
-bin/connect_time_%v6.o: connect_time_%v6.ll | bin
-	$(LINK)
-bin/connect_time_%v4_co-re.o: connect_time_%v4.ll | bin
-	$(LINK)
-bin/connect_time_%v46_co-re.o: connect_time_%v46.ll | bin
-	$(LINK)
-bin/connect_time_%v6_co-re.o: connect_time_%v6.ll | bin
-	$(LINK)
 ut/%.o: ut/%.ll
 	$(LINK)
 ut/ip_parse_test_v6.ll: ut/ip_parse_test.c
@@ -151,21 +157,102 @@ ut/ip_parse_test_v6.ll: ut/ip_parse_test.c
 ut/ip_parse_test_v6.o: ut/ip_parse_test_v6.ll
 	$(LINK)
 
+%_v4.ll: %.c %.d calculate-flags
+	$(COMPILE)
+%_no_log_v4.ll: %.c %.d calculate-flags
+	$(COMPILE)
+%_debug_v4.ll: %.c %.d calculate-flags
+	$(COMPILE)
+%_no_log_co-re_v4.ll: %.c %.d calculate-flags
+	$(COMPILE)
+%_debug_co-re_v4.ll: %.c %.d calculate-flags
+	$(COMPILE)
+
+%_v4.ll: %_v4.c %_v4.d calculate-flags
+	$(COMPILE)
+%_no_log_v4.ll: %_v4.c %_v4.d calculate-flags
+	$(COMPILE)
+%_debug_v4.ll: %_v4.c %_v4.d calculate-flags
+	$(COMPILE)
+%_no_log_co-re_v4.ll: %_v4.c %_v4.d calculate-flags
+	$(COMPILE)
+%_debug_co-re_v4.ll: %_v4.c %_v4.d calculate-flags
+	$(COMPILE)
+
+%_v46.ll: %_v46.c %_v46.d calculate-flags
+	$(COMPILE)
+%_no_log_v46.ll: %_v46.c %_v46.d calculate-flags
+	$(COMPILE)
+%_debug_v46.ll: %_v46.c %_v46.d calculate-flags
+	$(COMPILE)
+%_no_log_co-re_v46.ll: %_v46.c %_v46.d calculate-flags
+	$(COMPILE)
+%_debug_co-re_v46.ll: %_v46.c %_v46.d calculate-flags
+	$(COMPILE)
+
+%_v6.ll: %_v6.c %_v6.d calculate-flags
+	$(COMPILE)
+%_no_log_v6.ll: %_v6.c %_v6.d calculate-flags
+	$(COMPILE)
+%_debug_v6.ll: %_v6.c %_v6.d calculate-flags
+	$(COMPILE)
+%_no_log_co-re_v6.ll: %_v6.c %_v6.d calculate-flags
+	$(COMPILE)
+%_debug_co-re_v6.ll: %_v6.c %_v6.d calculate-flags
+	$(COMPILE)
+
+%_v6.ll: %.c %_v6.d calculate-flags
+	$(COMPILE)
+%_no_log_v6.ll: %.c %_v6.d calculate-flags
+	$(COMPILE)
+%_debug_v6.ll: %.c %_v6.d calculate-flags
+	$(COMPILE)
+%_no_log_co-re_v6.ll: %.c %_v6.d calculate-flags
+	$(COMPILE)
+%_debug_co-re_v6.ll: %.c %_v6.d calculate-flags
+	$(COMPILE)
+
+%_no_log.ll: %.c %.d calculate-flags
+	$(COMPILE)
+%_debug.ll: %.c %.d calculate-flags
+	$(COMPILE)
+%_no_log_co-re.ll: %.c %.d calculate-flags
+	$(COMPILE)
+%_debug_co-re.ll: %.c %.d calculate-flags
+	$(COMPILE)
+
+bin/%_v4.o: %_v4.ll | bin
+	$(LINK)
+bin/%_v46.o: %_v46.ll | bin
+	$(LINK)
+bin/%_v6.o: %_v6.ll | bin
+	$(LINK)
+bin/%.o: %.ll | bin
+	$(LINK)
+
 bin:
 	mkdir -p bin
 
-.PRECIOUS: %.d
-
 %.d: %.c
-	set -e; rm -f $@; \
+	$(COMPILE_DEPS)
+%_v6.d: CFLAGS+=-DIPVER6
+%_v6.d: %_v6.c
+	$(COMPILE_DEPS)
+%_v6.d: %.c
+	$(COMPILE_DEPS)
+
+
+.PRECIOUS: %.d %_v6.d
+
+COMPILE_DEPS=set -e; rm -f $@; \
 		$(CC) -M $(CFLAGS) $< > $@.$$$$ || { rm -f $@.$$$$; false; } ; \
 		sed 's,\($*\)\.o[ :]*,\1.o $@ : ,g' < $@.$$$$ > $@; \
 		rm -f $@.$$$$
 
-D_FILES=$(C_FILES:.c=.d)
-
 ifneq ($(MAKECMDGOALS),clean)
-include $(D_FILES)
+  ifneq ($(MAKECMDGOALS), libbpf)
+    include $(shell ls *.d)
+  endif
 endif
 
 clean:
