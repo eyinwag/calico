@@ -6,6 +6,53 @@ metadata:
   labels:
     k8s-app: tigera-operator
 rules:
+  # The tigera/operator installs CustomResourceDefinitions necessary for itself
+  # and Calico more broadly to function.
+  - apiGroups:
+      - apiextensions.k8s.io
+    resources:
+      - customresourcedefinitions
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+  # We only allow update access to our own CRDs.
+  - apiGroups:
+      - apiextensions.k8s.io
+    resources:
+      - customresourcedefinitions
+    verbs:
+      - update
+    resourceNames:
+      - adminnetworkpolicies.policy.networking.k8s.io
+      - apiservers.operator.tigera.io
+      - baselineadminnetworkpolicies.policy.networking.k8s.io
+      - imagesets.operator.tigera.io
+      - installations.operator.tigera.io
+      - tigerastatuses.operator.tigera.io
+      - bgpconfigurations.crd.projectcalico.org
+      - bgpfilters.crd.projectcalico.org
+      - bgppeers.crd.projectcalico.org
+      - blockaffinities.crd.projectcalico.org
+      - caliconodestatuses.crd.projectcalico.org
+      - clusterinformations.crd.projectcalico.org
+      - felixconfigurations.crd.projectcalico.org
+      - globalnetworkpolicies.crd.projectcalico.org
+      - stagedglobalnetworkpolicies.crd.projectcalico.org
+      - globalnetworksets.crd.projectcalico.org
+      - hostendpoints.crd.projectcalico.org
+      - ipamblocks.crd.projectcalico.org
+      - ipamconfigs.crd.projectcalico.org
+      - ipamhandles.crd.projectcalico.org
+      - ippools.crd.projectcalico.org
+      - ipreservations.crd.projectcalico.org
+      - kubecontrollersconfigurations.crd.projectcalico.org
+      - networkpolicies.crd.projectcalico.org
+      - stagednetworkpolicies.crd.projectcalico.org
+      - stagedkubernetesnetworkpolicies.crd.projectcalico.org
+      - networksets.crd.projectcalico.org
+      - tiers.crd.projectcalico.org
   - apiGroups:
       - ""
     resources:
@@ -16,7 +63,6 @@ rules:
       - endpoints
       - events
       - configmaps
-      - secrets
       - serviceaccounts
     verbs:
       - create
@@ -29,6 +75,7 @@ rules:
       - ""
     resources:
       - resourcequotas
+      - secrets
     verbs:
       - list
       - get
@@ -214,6 +261,12 @@ rules:
       - watch
       - create
       - update
+  - apiGroups:
+      - admissionregistration.k8s.io
+    resources:
+      - mutatingwebhookconfigurations
+    verbs:
+      - delete
   # Needed for operator lock
   - apiGroups:
       - coordination.k8s.io
@@ -326,5 +379,40 @@ rules:
     verbs:
       - create
       - update
+      - list
+      - watch
+  # For tiered network policy actions, tigera-apiserver requires that we authorize the operator for the tier.networkpolicies and tier.globalnetworkpolicies pseudo-kinds.
+  - apiGroups:
+      - projectcalico.org
+    resourceNames:
+      - allow-tigera.*
+    resources:
+      - tier.networkpolicies
+      - tier.globalnetworkpolicies
+    verbs:
+      - list
+      - watch
+      - get
+      - create
+      - update
+      - delete
+  # For tiered network policy actions, tigera-apiserver requires get authorization on the associated tier.
+  - apiGroups:
+      - projectcalico.org
+    resourceNames:
+      - allow-tigera
+    resources:
+      - tiers
+    verbs:
+      - get
+      - delete
+      - update
+  # Separated from the above rule since resourceNames does not support the create verb, and requires a field selector for list/watch verbs.
+  - apiGroups:
+      - projectcalico.org
+    resources:
+      - tiers
+    verbs:
+      - create
       - list
       - watch

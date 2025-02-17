@@ -115,12 +115,15 @@ class _TestEtcdBase(lib.Lib, unittest.TestCase):
             self.recent_writes[key] = value
 
         if 'metadata' in self.recent_writes[key]:
-            # If this is an update, check that the metadata other than labels
-            # is unchanged.
+            # If this is an update, check that the metadata, other than labels
+            # and annotations, is unchanged.
             if existing_v3_metadata:
                 if 'labels' in self.recent_writes[key]['metadata']:
                     existing_v3_metadata['labels'] = \
                         self.recent_writes[key]['metadata']['labels']
+                if 'annotations' in self.recent_writes[key]['metadata']:
+                    existing_v3_metadata['annotations'] = \
+                        self.recent_writes[key]['metadata']['annotations']
                 self.assertEqual(existing_v3_metadata,
                                  self.recent_writes[key]['metadata'])
             # Now delete not-easily-predictable metadata fields from the data
@@ -350,6 +353,8 @@ class TestPluginEtcdBase(_TestEtcdBase):
         lib.m_compat.cfg.CONF.calico.etcd_compaction_period_mins = 0
         lib.m_compat.cfg.CONF.calico.project_name_cache_max = 0
         lib.m_compat.cfg.CONF.calico.openstack_region = self.region
+        lib.m_compat.cfg.CONF.calico.max_ingress_connections_per_port = 0
+        lib.m_compat.cfg.CONF.calico.max_egress_connections_per_port = 0
         calico_config._reset_globals()
         datamodel_v2._reset_globals()
 
@@ -414,6 +419,7 @@ class TestPluginEtcdBase(_TestEtcdBase):
     def test_start_two_ports(self):
         """Startup with two existing ports but no existing etcd data."""
         # Provide two Neutron ports.
+        self.osdb_networks = [lib.network1, lib.network2]
         self.osdb_ports = [lib.port1, lib.port2]
 
         # Allow the etcd transport's resync thread to run.
@@ -449,7 +455,9 @@ class TestPluginEtcdBase(_TestEtcdBase):
                     'projectcalico.org/openstack-project-id': 'jane3',
                     'projectcalico.org/openstack-project-name': 'pname_jane3',
                     'projectcalico.org/openstack-project-parent-id': 'gibson',
-                    'projectcalico.org/orchestrator': 'openstack'
+                    'projectcalico.org/orchestrator': 'openstack',
+                    'projectcalico.org/openstack-network-name':
+                    'calico-network-name'
                 }
             },
             'spec': {'endpoint': 'DEADBEEF-1234-5678',
@@ -484,7 +492,9 @@ class TestPluginEtcdBase(_TestEtcdBase):
                     'projectcalico.org/openstack-project-id': 'jane3',
                     'projectcalico.org/openstack-project-name': 'pname_jane3',
                     'projectcalico.org/openstack-project-parent-id': 'gibson',
-                    'projectcalico.org/orchestrator': 'openstack'
+                    'projectcalico.org/orchestrator': 'openstack',
+                    'projectcalico.org/openstack-network-name':
+                    'calico-network-name'
                 }
             },
             'spec': {'endpoint': 'FACEBEEF-1234-5678',
@@ -517,8 +527,7 @@ class TestPluginEtcdBase(_TestEtcdBase):
         # Delete lib.port1.
         context = self.make_context()
         context._port = lib.port1
-        context._plugin_context.session.query.return_value.filter_by.\
-            side_effect = self.port_query
+        context._plugin_context.session.query.side_effect = self.db_query
         self.driver.delete_port_postcommit(context)
         self.assertEtcdWrites({})
         self.assertEtcdDeletes(set([ep_deadbeef_key_v3]))
@@ -619,7 +628,9 @@ class TestPluginEtcdBase(_TestEtcdBase):
                     'projectcalico.org/openstack-project-id': 'jane3',
                     'projectcalico.org/openstack-project-name': 'pname_jane3',
                     'projectcalico.org/openstack-project-parent-id': 'gibson',
-                    'projectcalico.org/orchestrator': 'openstack'
+                    'projectcalico.org/orchestrator': 'openstack',
+                    'projectcalico.org/openstack-network-name':
+                    'calico-network-name'
                 }
             },
             'spec': {'endpoint': 'HELLO-1234-5678',
@@ -891,6 +902,87 @@ class TestPluginEtcdBase(_TestEtcdBase):
         }
         self.assertEtcdWrites(expected_writes)
         self.assertEtcdDeletes(set())
+
+        # Change network used
+        _log.info("Change network used by endpoint HELLO")
+        context._port['network_id'] = 'calico-other-network-id'
+        self.osdb_ports[0]['network_id'] = 'calico-other-network-id'
+        self.driver.update_port_postcommit(context)
+
+        # Expected changes
+        ep_hello_value_v3['metadata']['labels'][
+            'projectcalico.org/openstack-network-name'] = 'my-first-network'
+        ep_hello_value_v3['metadata']['annotations'][
+            'openstack.projectcalico.org/network-id'] = \
+            'calico-other-network-id'
+        expected_writes = {
+            ep_hello_key_v3: ep_hello_value_v3,
+            sg_1_key_v3: sg_1_value_v3,
+        }
+        self.assertEtcdWrites(expected_writes)
+        self.assertEtcdDeletes(set())
+
+        # Add a QoS policy.
+        context._port['qos_policy_id'] = '1'
+        self.osdb_ports[0]['qos_policy_id'] = '1'
+        self.driver.update_port_postcommit(context)
+
+        # Expected changes
+        ep_hello_value_v3['spec']['qosControls'] = {
+            'egressBandwidth': 10000000,
+        }
+        expected_writes = {
+            ep_hello_key_v3: ep_hello_value_v3,
+            sg_1_key_v3: sg_1_value_v3,
+        }
+        self.assertEtcdWrites(expected_writes)
+        self.assertEtcdDeletes(set())
+
+        # Add configuration for max connections.
+        lib.m_compat.cfg.CONF.calico.max_ingress_connections_per_port = 10
+        lib.m_compat.cfg.CONF.calico.max_egress_connections_per_port = 20
+        self.driver.update_port_postcommit(context)
+
+        # Expected changes
+        ep_hello_value_v3['spec']['qosControls'] = {
+            'egressBandwidth': 10000000,
+            'ingressMaxConnections': 10,
+            'egressMaxConnections': 20,
+        }
+        expected_writes = {
+            ep_hello_key_v3: ep_hello_value_v3,
+            sg_1_key_v3: sg_1_value_v3,
+        }
+        self.assertEtcdWrites(expected_writes)
+        self.assertEtcdDeletes(set())
+
+        # Change to a QoS policy that will set all possible settings.
+        context._port['qos_policy_id'] = '2'
+        self.osdb_ports[0]['qos_policy_id'] = '2'
+        self.driver.update_port_postcommit(context)
+
+        # Expected changes
+        ep_hello_value_v3['spec']['qosControls'] = {
+            'ingressBandwidth': 1000,
+            'egressBandwidth': 3000,
+            'ingressBurst': 2000,
+            'egressBurst': 4000,
+            'ingressPacketRate': 5000,
+            'egressPacketRate': 6000,
+            'ingressMaxConnections': 10,
+            'egressMaxConnections': 20,
+        }
+        expected_writes = {
+            ep_hello_key_v3: ep_hello_value_v3,
+            sg_1_key_v3: sg_1_value_v3,
+        }
+        self.assertEtcdWrites(expected_writes)
+        self.assertEtcdDeletes(set())
+
+        # Reset for future tests.
+        lib.m_compat.cfg.CONF.calico.max_ingress_connections_per_port = 0
+        lib.m_compat.cfg.CONF.calico.max_egress_connections_per_port = 0
+        del self.osdb_ports[0]['qos_policy_id']
 
         # Reset the state for safety.
         self.osdb_ports[0]['fixed_ips'] = old_ips

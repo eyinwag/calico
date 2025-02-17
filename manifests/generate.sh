@@ -14,7 +14,7 @@ CALICO_VERSION=${CALICO_VERSION:-$defaultCalicoVersion}
 defaultOperatorVersion=$(cat ../charts/tigera-operator/values.yaml | grep version: | cut -d" " -f4)
 OPERATOR_VERSION=${OPERATOR_VERSION:-$defaultOperatorVersion}
 
-NON_HELM_MANIFEST_IMAGES="calico/apiserver calico/windows calico/ctl calico/csi calico/node-driver-registrar calico/dikastes"
+NON_HELM_MANIFEST_IMAGES="calico/apiserver calico/windows calico/ctl calico/csi calico/node-driver-registrar calico/dikastes calico/flannel-migration-controller"
 
 echo "Generating manifests for Calico=$CALICO_VERSION and tigera-operator=$OPERATOR_VERSION"
 
@@ -32,7 +32,6 @@ metadata:
 EOF
 
 ${HELM} -n tigera-operator template \
-	--include-crds \
 	--no-hooks \
 	--set installation.enabled=false \
 	--set apiServer.enabled=false \
@@ -96,12 +95,12 @@ done
 # OCP requires resources in their own yaml files, so output to a dir.
 # Then do a bit of cleanup to reduce the directory depth to 1.
 ##########################################################################
-${HELM} template --include-crds \
+${HELM} template \
 	-n tigera-operator \
 	../charts/tigera-operator/ \
 	--output-dir ocp \
 	--no-hooks \
-	--set installation.kubernetesProvider=openshift \
+	--set installation.kubernetesProvider=OpenShift \
 	--set installation.enabled=false \
 	--set apiServer.enabled=false \
 	--set tigeraOperator.version=$OPERATOR_VERSION \

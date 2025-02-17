@@ -21,16 +21,15 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/sys/unix"
-
-	"github.com/projectcalico/calico/felix/logutils"
-	. "github.com/projectcalico/calico/felix/routerule"
-
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	log "github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
+	"k8s.io/utils/ptr"
 
+	"github.com/projectcalico/calico/felix/logutils"
+	. "github.com/projectcalico/calico/felix/routerule"
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
 )
 
@@ -154,7 +153,7 @@ var _ = Describe("RouteRules", func() {
 				Family:            unix.AF_INET,
 				Src:               mustParseCIDR("10.0.0.1/32"),
 				Mark:              0x100,
-				Mask:              0x100,
+				Mask:              ptr.To[uint32](0x100),
 				Table:             1,
 				Invert:            true,
 				Goto:              -1,
@@ -174,7 +173,7 @@ var _ = Describe("RouteRules", func() {
 				Family:            unix.AF_INET,
 				Src:               mustParseCIDR("10.0.0.2/32"),
 				Mark:              0x200,
-				Mask:              0x200,
+				Mask:              ptr.To[uint32](0x200),
 				Table:             10,
 				Invert:            false,
 				Goto:              -1,
@@ -190,7 +189,7 @@ var _ = Describe("RouteRules", func() {
 				Family:            unix.AF_INET,
 				Src:               mustParseCIDR("10.0.0.1/32"),
 				Mark:              0x800,
-				Mask:              0x800,
+				Mask:              ptr.To[uint32](0x800),
 				Table:             90,
 				Invert:            true,
 				Goto:              -1,
@@ -222,7 +221,7 @@ var _ = Describe("RouteRules", func() {
 					Family:            unix.AF_INET,
 					Src:               mustParseCIDR("10.0.0.3/32"),
 					Mark:              0x400,
-					Mask:              0x400,
+					Mask:              ptr.To[uint32](0x400),
 					Table:             250,
 					Goto:              -1,
 					Flow:              -1,
@@ -267,7 +266,7 @@ var _ = Describe("RouteRules", func() {
 				Family:            unix.AF_INET,
 				Src:               mustParseCIDR("10.0.0.2/32"),
 				Mark:              0x200,
-				Mask:              0x200,
+				Mask:              ptr.To[uint32](0x200),
 				Table:             250,
 				Goto:              -1,
 				Flow:              -1,
@@ -354,7 +353,7 @@ var _ = Describe("RouteRules", func() {
 						Family:            unix.AF_INET,
 						Src:               mustParseCIDR("10.0.0.3/32"),
 						Mark:              0x400,
-						Mask:              0x400,
+						Mask:              ptr.To[uint32](0x400),
 						Table:             250,
 						Goto:              -1,
 						Flow:              -1,

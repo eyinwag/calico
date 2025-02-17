@@ -75,7 +75,7 @@ func runAttachTest(t *testing.T, ipv6Enabled bool) {
 	)
 	Expect(err).NotTo(HaveOccurred())
 
-	host1 := createVethName("hostep1")
+	host1 := createHostIf("hostep1")
 	defer deleteLink(host1)
 
 	workload0 := createVethName("workloadep0")
@@ -190,8 +190,8 @@ func runAttachTest(t *testing.T, ipv6Enabled bool) {
 			Policy: &proto.Policy{Untracked: true},
 		})
 
-		bpfEpMgr.OnHEPUpdate(map[string]proto.HostEndpoint{
-			"hostep1": proto.HostEndpoint{
+		bpfEpMgr.OnHEPUpdate(map[string]*proto.HostEndpoint{
+			"hostep1": &proto.HostEndpoint{
 				Name: "hostep1",
 				UntrackedTiers: []*proto.TierInfo{
 					&proto.TierInfo{
@@ -261,8 +261,8 @@ func runAttachTest(t *testing.T, ipv6Enabled bool) {
 		bpfEpMgr.OnUpdate(&proto.ActivePolicyRemove{
 			Id: &proto.PolicyID{Tier: "default", Name: "untracked"},
 		})
-		bpfEpMgr.OnHEPUpdate(map[string]proto.HostEndpoint{
-			"hostep1": proto.HostEndpoint{
+		bpfEpMgr.OnHEPUpdate(map[string]*proto.HostEndpoint{
+			"hostep1": &proto.HostEndpoint{
 				Name: "hostep1",
 			},
 		})
@@ -278,7 +278,7 @@ func runAttachTest(t *testing.T, ipv6Enabled bool) {
 		Expect(xdpProgs).To(HaveLen(0))
 	})
 
-	host2 := createVethName("hostep2")
+	host2 := createHostIf("hostep2")
 	defer deleteLink(host2)
 
 	t.Run("create another host interface without a host endpoint (no policy)", func(t *testing.T) {
@@ -813,6 +813,97 @@ func TestRepeatedAttach(t *testing.T) {
 			Expect(tcRes.Handle()).To(Equal(handle))
 		}
 	}
+}
+
+func TestLogFilters(t *testing.T) {
+	RegisterTestingT(t)
+
+	bpfmaps, err := bpfmap.CreateBPFMaps(false)
+	Expect(err).NotTo(HaveOccurred())
+
+	commonMaps := bpfmaps.CommonMaps
+
+	cfg := linux.Config{
+		Hostname:              "uthost",
+		BPFLogLevel:           "debug",
+		BPFDataIfacePattern:   regexp.MustCompile("^hostep[12]"),
+		VXLANMTU:              1000,
+		VXLANPort:             1234,
+		BPFNodePortDSREnabled: false,
+		RulesConfig: rules.Config{
+			EndpointToHostAction: "RETURN",
+		},
+		BPFExtToServiceConnmark: 0,
+		FeatureGates: map[string]string{
+			"BPFConnectTimeLoadBalancingWorkaround": "enabled",
+		},
+		BPFPolicyDebugEnabled: true,
+		BPFLogFilters:         map[string]string{"hostep1": "tcp"},
+	}
+
+	bpfEpMgr, err := linux.NewTestEpMgr(
+		&cfg,
+		bpfmaps,
+		regexp.MustCompile("^workloadep[0123]"),
+	)
+	Expect(err).NotTo(HaveOccurred())
+
+	host1 := createHostIf("hostep1")
+	defer deleteLink(host1)
+
+	workload0 := createVethName("workloadep0")
+	defer deleteLink(workload0)
+
+	t.Run("load filter", func(t *testing.T) {
+		bpfEpMgr.OnUpdate(linux.NewIfaceStateUpdate("hostep1", ifacemonitor.StateUp, host1.Attrs().Index))
+		bpfEpMgr.OnUpdate(linux.NewIfaceStateUpdate("workloadep0", ifacemonitor.StateUp, workload0.Attrs().Index))
+		bpfEpMgr.OnUpdate(linux.NewIfaceAddrsUpdate("hostep1", "1.2.3.4"))
+		bpfEpMgr.OnUpdate(&proto.HostMetadataUpdate{Hostname: "uthost", Ipv4Addr: "1.2.3.4"})
+		err = bpfEpMgr.CompleteDeferredWork()
+		Expect(err).NotTo(HaveOccurred())
+
+		ifstateMap := ifstateMapDump(commonMaps.IfStateMap)
+
+		Expect(ifstateMap).To(HaveKey(ifstate.NewKey(uint32(host1.Attrs().Index))))
+		hostep1State := ifstateMap[ifstate.NewKey(uint32(host1.Attrs().Index))]
+		Expect(hostep1State.TcIngressFilter()).NotTo(Equal(-1))
+		Expect(hostep1State.TcEgressFilter()).NotTo(Equal(-1))
+
+		Expect(ifstateMap).To(HaveKey(ifstate.NewKey(uint32(workload0.Attrs().Index))))
+		wl0State := ifstateMap[ifstate.NewKey(uint32(workload0.Attrs().Index))]
+		Expect(wl0State.TcIngressFilter()).To(Equal(-1))
+		Expect(wl0State.TcEgressFilter()).To(Equal(-1))
+	})
+
+	cfg.BPFLogLevel = "off"
+
+	bpfEpMgr, err = linux.NewTestEpMgr(
+		&cfg,
+		bpfmaps,
+		regexp.MustCompile("^workloadep[0123]"),
+	)
+	Expect(err).NotTo(HaveOccurred())
+
+	t.Run("after restart, load filter", func(t *testing.T) {
+		bpfEpMgr.OnUpdate(linux.NewIfaceStateUpdate("hostep1", ifacemonitor.StateUp, host1.Attrs().Index))
+		bpfEpMgr.OnUpdate(linux.NewIfaceStateUpdate("workloadep0", ifacemonitor.StateUp, workload0.Attrs().Index))
+		bpfEpMgr.OnUpdate(linux.NewIfaceAddrsUpdate("hostep1", "1.2.3.4"))
+		bpfEpMgr.OnUpdate(&proto.HostMetadataUpdate{Hostname: "uthost", Ipv4Addr: "1.2.3.4"})
+		err = bpfEpMgr.CompleteDeferredWork()
+		Expect(err).NotTo(HaveOccurred())
+
+		ifstateMap := ifstateMapDump(commonMaps.IfStateMap)
+
+		Expect(ifstateMap).To(HaveKey(ifstate.NewKey(uint32(host1.Attrs().Index))))
+		hostep1State := ifstateMap[ifstate.NewKey(uint32(host1.Attrs().Index))]
+		Expect(hostep1State.TcIngressFilter()).To(Equal(-1))
+		Expect(hostep1State.TcEgressFilter()).To(Equal(-1))
+
+		Expect(ifstateMap).To(HaveKey(ifstate.NewKey(uint32(workload0.Attrs().Index))))
+		wl0State := ifstateMap[ifstate.NewKey(uint32(workload0.Attrs().Index))]
+		Expect(wl0State.TcIngressFilter()).To(Equal(-1))
+		Expect(wl0State.TcEgressFilter()).To(Equal(-1))
+	})
 }
 
 func ifstateMapDump(m maps.Map) ifstate.MapMem {

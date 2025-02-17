@@ -15,26 +15,24 @@
 package proxy_test
 
 import (
+	"fmt"
 	"net"
 	"sync"
 	"time"
 
-	"github.com/projectcalico/calico/felix/bpf/maps"
-	"github.com/projectcalico/calico/felix/bpf/nat"
-
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
-	k8sp "k8s.io/kubernetes/pkg/proxy"
-
 	"k8s.io/apimachinery/pkg/util/sets"
+	k8sp "k8s.io/kubernetes/pkg/proxy"
 
 	"github.com/projectcalico/calico/felix/bpf"
 	"github.com/projectcalico/calico/felix/bpf/conntrack"
+	"github.com/projectcalico/calico/felix/bpf/maps"
 	"github.com/projectcalico/calico/felix/bpf/mock"
+	"github.com/projectcalico/calico/felix/bpf/nat"
 	proxy "github.com/projectcalico/calico/felix/bpf/proxy"
 	"github.com/projectcalico/calico/felix/bpf/routes"
 	"github.com/projectcalico/calico/felix/ip"
@@ -332,7 +330,7 @@ var _ = Describe("BPF Syncer", func() {
 				net.IPv4(10, 0, 0, 2),
 				2222,
 				v1.ProtocolTCP,
-				proxy.K8sSvcWithExternalIPs([]string{"35.0.0.2"}),
+				proxy.K8sSvcWithExternalIPs([]net.IP{net.IPv4(35, 0, 0, 2)}),
 			)
 
 			err := s.Apply(state)
@@ -358,7 +356,7 @@ var _ = Describe("BPF Syncer", func() {
 				net.IPv4(10, 0, 0, 2),
 				2222,
 				v1.ProtocolTCP,
-				proxy.K8sSvcWithExternalIPs([]string{"35.0.0.2"}),
+				proxy.K8sSvcWithExternalIPs([]net.IP{net.IPv4(35, 0, 0, 2)}),
 			)
 
 			err := s.Apply(state)
@@ -1328,11 +1326,11 @@ func (m *mockNATMap) Update(k, v []byte) error {
 
 	ks := len(nat.FrontendKey{})
 	if len(k) != ks {
-		return errors.Errorf("expected key size %d got %d", ks, len(k))
+		return fmt.Errorf("expected key size %d got %d", ks, len(k))
 	}
 	vs := len(nat.FrontendValue{})
 	if len(v) != vs {
-		return errors.Errorf("expected value size %d got %d", vs, len(v))
+		return fmt.Errorf("expected value size %d got %d", vs, len(v))
 	}
 
 	var key nat.FrontendKey
@@ -1360,7 +1358,7 @@ func (m *mockNATMap) Delete(k []byte) error {
 
 	ks := len(nat.FrontendKey{})
 	if len(k) != ks {
-		return errors.Errorf("expected key size %d got %d", ks, len(k))
+		return fmt.Errorf("expected key size %d got %d", ks, len(k))
 	}
 
 	var key nat.FrontendKey
@@ -1421,11 +1419,11 @@ func (m *mockNATBackendMap) Update(k, v []byte) error {
 
 	ks := len(nat.BackendKey{})
 	if len(k) != ks {
-		return errors.Errorf("expected key size %d got %d", ks, len(k))
+		return fmt.Errorf("expected key size %d got %d", ks, len(k))
 	}
 	vs := len(nat.BackendValue{})
 	if len(v) != vs {
-		return errors.Errorf("expected value size %d got %d", vs, len(v))
+		return fmt.Errorf("expected value size %d got %d", vs, len(v))
 	}
 
 	var key nat.BackendKey
@@ -1453,7 +1451,7 @@ func (m *mockNATBackendMap) Delete(k []byte) error {
 
 	ks := len(nat.BackendKey{})
 	if len(k) != ks {
-		return errors.Errorf("expected key size %d got %d", ks, len(k))
+		return fmt.Errorf("expected key size %d got %d", ks, len(k))
 	}
 
 	var key nat.BackendKey
@@ -1506,11 +1504,11 @@ func (m *mockAffinityMap) Update(k, v []byte) error {
 
 	ks := len(nat.AffinityKey{})
 	if len(k) != ks {
-		return errors.Errorf("expected key size %d got %d", ks, len(k))
+		return fmt.Errorf("expected key size %d got %d", ks, len(k))
 	}
 	vs := len(nat.AffinityValue{})
 	if len(v) != vs {
-		return errors.Errorf("expected value size %d got %d", vs, len(v))
+		return fmt.Errorf("expected value size %d got %d", vs, len(v))
 	}
 
 	var key nat.AffinityKey
@@ -1534,7 +1532,7 @@ func (m *mockAffinityMap) Delete(k []byte) error {
 
 	ks := len(nat.AffinityKey{})
 	if len(k) != ks {
-		return errors.Errorf("expected key size %d got %d", ks, len(k))
+		return fmt.Errorf("expected key size %d got %d", ks, len(k))
 	}
 
 	var key nat.AffinityKey
@@ -1563,12 +1561,12 @@ func ctEntriesForSvc(ct maps.Map, proto v1.Protocol,
 
 	key := conntrack.NewKey(p, srcIP, srcPort, svcIP, svcPort)
 	revKey := conntrack.NewKey(p, srcIP, srcPort, net.ParseIP(ep.IP()), uint16(epPort))
-	val := conntrack.NewValueNATForward(0, 0, 0, revKey)
+	val := conntrack.NewValueNATForward(0, 0, revKey)
 
 	err = ct.Update(key.AsBytes(), val.AsBytes())
 	Expect(err).NotTo(HaveOccurred(), "Test failed to populate ct map with FWD entry")
 
-	val = conntrack.NewValueNATReverse(0, 0, 0, conntrack.Leg{}, conntrack.Leg{},
+	val = conntrack.NewValueNATReverse(0, 0, conntrack.Leg{}, conntrack.Leg{},
 		net.IPv4(0, 0, 0, 0), svcIP, svcPort)
 
 	err = ct.Update(revKey.AsBytes(), val.AsBytes())

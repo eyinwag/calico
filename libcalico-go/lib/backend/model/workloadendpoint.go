@@ -16,15 +16,13 @@ package model
 
 import (
 	"fmt"
-
+	"reflect"
 	"regexp"
 
-	"reflect"
-
+	"github.com/projectcalico/api/pkg/lib/numorstring"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/projectcalico/api/pkg/lib/numorstring"
-
+	v3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
 	"github.com/projectcalico/calico/libcalico-go/lib/errors"
 	"github.com/projectcalico/calico/libcalico-go/lib/net"
 )
@@ -166,6 +164,7 @@ type WorkloadEndpoint struct {
 	GenerateName               string            `json:"generate_name,omitempty"`
 	AllowSpoofedSourcePrefixes []net.IPNet       `json:"allow_spoofed_source_ips,omitempty"`
 	Annotations                map[string]string `json:"annotations,omitempty"`
+	QoSControls                *QoSControls      `json:"qosControls,omitempty"`
 }
 
 type EndpointPort struct {
@@ -183,3 +182,5 @@ type IPNAT struct {
 	// The external IP address.
 	ExtIP net.IP `json:"ext_ip" validate:"ip"`
 }
+
+type QoSControls = v3.QoSControls

@@ -15,9 +15,8 @@
 package resources
 
 import (
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 )
@@ -49,6 +48,6 @@ func DefaultAllowProfile() *model.KVPair {
 			Kind: v3.KindProfile,
 		},
 		Value:    profile,
-		Revision: "0",
+		Revision: "1",
 	}
 }

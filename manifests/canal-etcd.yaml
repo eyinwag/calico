@@ -610,7 +610,7 @@ spec:
         # Runs the flannel daemon to enable vxlan networking between
         # container hosts.
         - name: flannel
-          image: docker.io/flannel/flannel:v0.24.3
+          image: docker.io/flannel/flannel:v0.24.4
           imagePullPolicy: IfNotPresent
           env:
             # The location of the etcd cluster.
@@ -812,7 +812,7 @@ spec:
                   key: etcd_cert
             # Choose which controllers to run.
             - name: ENABLED_CONTROLLERS
-              value: policy,namespace,serviceaccount,workloadendpoint,node
+              value: policy,namespace,serviceaccount,workloadendpoint,node,loadbalancer
           volumeMounts:
             # Mount in the etcd TLS secrets.
             - mountPath: /calico-secrets

@@ -18,11 +18,10 @@ import (
 	"context"
 	"fmt"
 
-	"sigs.k8s.io/knftables"
-
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
+	"sigs.k8s.io/knftables"
 
 	"github.com/projectcalico/calico/felix/ipsets"
 	"github.com/projectcalico/calico/felix/logutils"
@@ -143,6 +142,24 @@ var _ = Describe("IPSets with empty data plane", func() {
 			&knftables.Element{Set: "cali40test", Key: []string{"10.0.0.1"}},
 			&knftables.Element{Set: "cali40test", Key: []string{"10.0.0.2"}},
 		))
+	})
+
+	It("should resync with a large number of sets", func() {
+		// Create a large number of sets - larger than the number of gorooutines we limit
+		// ourselves to in the resync code.
+		tx := f.NewTransaction()
+		tx.Add(&knftables.Table{})
+		for i := 0; i < 200; i++ {
+			tx.Add(&knftables.Set{
+				Name: fmt.Sprintf("set-%d", i),
+				Type: "ipv4_addr",
+			})
+		}
+		Expect(f.Run(context.Background(), tx)).NotTo(HaveOccurred())
+
+		// Trigger a resync.
+		s.QueueResync()
+		Expect(s.ApplyUpdates).NotTo(Panic())
 	})
 
 	It("should handle unexpected sets with types that are not supported", func() {

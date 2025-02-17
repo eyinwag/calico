@@ -18,14 +18,13 @@ import (
 	"context"
 	"sync/atomic"
 
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	log "github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/api/meta"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/uuid"
-
-	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
 	bapi "github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
@@ -251,7 +250,7 @@ func (c *resources) Watch(ctx context.Context, opts options.ListOptions, kind st
 
 	// Create the backend watcher.  We need to process the results to add revision data etc.
 	ctx, cancel := context.WithCancel(ctx)
-	backend, err := c.backend.Watch(ctx, list, opts.ResourceVersion)
+	backend, err := c.backend.Watch(ctx, list, bapi.WatchOptions{Revision: opts.ResourceVersion})
 	if err != nil {
 		cancel()
 		return nil, err

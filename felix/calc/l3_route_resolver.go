@@ -22,6 +22,9 @@ import (
 
 	"github.com/sirupsen/logrus"
 
+	"github.com/projectcalico/calico/felix/dispatcher"
+	"github.com/projectcalico/calico/felix/ip"
+	"github.com/projectcalico/calico/felix/proto"
 	apiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/encap"
@@ -29,13 +32,9 @@ import (
 	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
 	cresources "github.com/projectcalico/calico/libcalico-go/lib/resources"
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
-
-	"github.com/projectcalico/calico/felix/dispatcher"
-	"github.com/projectcalico/calico/felix/ip"
-	"github.com/projectcalico/calico/felix/proto"
 )
 
-// L3RouteResolver is responsible for indexing (currently only IPv4 versions of):
+// L3RouteResolver is responsible for indexing :
 //
 // - IPAM blocks
 // - IP pools
@@ -46,7 +45,7 @@ import (
 // - The relevant destination CIDR.
 // - The IP pool type that contains the CIDR (or none).
 // - Other metadata about the containing IP pool.
-// - Whether this (/32) CIDR is a host or not.
+// - Whether this (/32) CIDR is a host or not. (or /128 for IPv6)
 // - For workload CIDRs, the IP and name of the host that contains the workload.
 //
 // The BPF dataplane use the above to form a map of IP space so it can look up whether a particular
@@ -171,7 +170,7 @@ func (i l3rrNodeInfo) AddressesAsCIDRs() []ip.CIDR {
 	return cidrs
 }
 
-func NewL3RouteResolver(hostname string, callbacks PipelineCallbacks, useNodeResourceUpdates bool, routeSource string) *L3RouteResolver {
+func NewL3RouteResolver(hostname string, callbacks routeCallbacks, useNodeResourceUpdates bool, routeSource string) *L3RouteResolver {
 	logrus.Info("Creating L3 route resolver")
 	l3rr := &L3RouteResolver{
 		myNodeName: hostname,
@@ -743,11 +742,12 @@ func (c *L3RouteResolver) flush() {
 		}
 
 		rt := &proto.RouteUpdate{
-			Type:       proto.RouteType_CIDR_INFO,
 			IpPoolType: proto.IPPoolType_NONE,
 			Dst:        cidr.String(),
 		}
 		poolAllowsCrossSubnet := false
+		var blockSeen bool
+		var blockNodeName string
 		for _, entry := range buf {
 			ri := entry.Data.(RouteInfo)
 			if len(ri.Pools) > 0 {
@@ -767,13 +767,20 @@ func (c *L3RouteResolver) flush() {
 			}
 			if len(ri.Blocks) > 0 {
 				// We only expect one Block entry for any given CIDR. This constraint is upheld by the datastore.
+				if blockSeen && blockNodeName != ri.Blocks[0].NodeName {
+					logCxt.Debug("Borrowed block IP")
+					rt.Borrowed = true
+				} else {
+					blockSeen = true
+					blockNodeName = ri.Blocks[0].NodeName
+				}
 				rt.DstNodeName = ri.Blocks[0].NodeName
 				if rt.DstNodeName == c.myNodeName {
 					logCxt.Debug("Local workload route.")
-					rt.Type = proto.RouteType_LOCAL_WORKLOAD
+					rt.Types |= proto.RouteType_LOCAL_WORKLOAD
 				} else {
 					logCxt.Debug("Remote workload route.")
-					rt.Type = proto.RouteType_REMOTE_WORKLOAD
+					rt.Types |= proto.RouteType_REMOTE_WORKLOAD
 				}
 			}
 			if len(ri.Host.NodeNames) > 0 {
@@ -781,10 +788,10 @@ func (c *L3RouteResolver) flush() {
 
 				if rt.DstNodeName == c.myNodeName {
 					logCxt.Debug("Local host route.")
-					rt.Type = proto.RouteType_LOCAL_HOST
+					rt.Types |= proto.RouteType_LOCAL_HOST
 				} else {
 					logCxt.Debug("Remote host route.")
-					rt.Type = proto.RouteType_REMOTE_HOST
+					rt.Types |= proto.RouteType_REMOTE_HOST
 				}
 			}
 
@@ -795,21 +802,25 @@ func (c *L3RouteResolver) flush() {
 				// multiple workload, or workload and tunnel, or multiple node Refs with the same IP. Since this will be
 				// transient, we can always just use the first entry (and related tunnel entries)
 				rt.DstNodeName = ri.Refs[0].NodeName
+				if blockSeen && blockNodeName != rt.DstNodeName {
+					logCxt.Debug("Borrowed ref IP")
+					rt.Borrowed = true
+				}
 				if ri.Refs[0].RefType == RefTypeWEP {
 					// This is not a tunnel ref, so must be a workload.
 					if ri.Refs[0].NodeName == c.myNodeName {
-						rt.Type = proto.RouteType_LOCAL_WORKLOAD
 						rt.LocalWorkload = true
+						rt.Types |= proto.RouteType_LOCAL_WORKLOAD
 					} else {
-						rt.Type = proto.RouteType_REMOTE_WORKLOAD
+						rt.Types |= proto.RouteType_REMOTE_WORKLOAD
 					}
 				} else {
 					// This is a tunnel ref, set type and also store the tunnel type in the route. It is possible for
 					// multiple tunnels to have the same IP, so collate all tunnel types on the same node.
 					if ri.Refs[0].NodeName == c.myNodeName {
-						rt.Type = proto.RouteType_LOCAL_TUNNEL
+						rt.Types |= proto.RouteType_LOCAL_TUNNEL
 					} else {
-						rt.Type = proto.RouteType_REMOTE_TUNNEL
+						rt.Types |= proto.RouteType_REMOTE_TUNNEL
 					}
 
 					rt.TunnelType = &proto.TunnelType{}
@@ -832,10 +843,13 @@ func (c *L3RouteResolver) flush() {
 			}
 		}
 
+		var ipFamily int
+
 		if rt.DstNodeName != "" {
 			dstNodeInfo, exists := c.nodeNameToNodeInfo[rt.DstNodeName]
 			if exists {
-				switch cidr.Version() {
+				ipFamily = int(cidr.Version())
+				switch ipFamily {
 				case 4:
 					if dstNodeInfo.V4Addr != emptyV4Addr {
 						rt.DstNodeIp = dstNodeInfo.V4Addr.String()
@@ -849,7 +863,7 @@ func (c *L3RouteResolver) flush() {
 				}
 			}
 		}
-		rt.SameSubnet = poolAllowsCrossSubnet && c.nodeInOurSubnet(rt.DstNodeName)
+		rt.SameSubnet = poolAllowsCrossSubnet && c.nodeInOurSubnet(rt.DstNodeName, ipFamily)
 
 		if rt.Dst != emptyV4Addr.AsCIDR().String() && rt.Dst != emptyV6Addr.AsCIDR().String() {
 			// Skip sending a route for an empty CIDR
@@ -864,7 +878,7 @@ func (c *L3RouteResolver) flush() {
 
 // nodeInOurSubnet returns true if the IP of the given node is known and it's in our subnet.
 // Return false if either the remote IP or our subnet is not known.
-func (c *L3RouteResolver) nodeInOurSubnet(name string) bool {
+func (c *L3RouteResolver) nodeInOurSubnet(name string, ipFamily int) bool {
 	localNodeInfo, exists := c.nodeNameToNodeInfo[c.myNodeName]
 	if !exists {
 		return false
@@ -875,10 +889,14 @@ func (c *L3RouteResolver) nodeInOurSubnet(name string) bool {
 		return false
 	}
 
-	sameV4 := localNodeInfo.V4CIDR.ContainsV4(nodeInfo.V4Addr)
-	sameV6 := localNodeInfo.V6CIDR != ip.V6CIDR{} && nodeInfo.V6Addr != ip.V6Addr{} && localNodeInfo.V6CIDR.ContainsV6(nodeInfo.V6Addr)
+	switch ipFamily {
+	case 4:
+		return localNodeInfo.V4CIDR != ip.V4CIDR{} && localNodeInfo.V4CIDR.ContainsV4(nodeInfo.V4Addr)
+	case 6:
+		return localNodeInfo.V6CIDR != ip.V6CIDR{} && localNodeInfo.V6CIDR.ContainsV6(nodeInfo.V6Addr)
+	}
 
-	return sameV4 || sameV6
+	return false
 }
 
 func (c *L3RouteResolver) maybeReportLive() {

@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,20 +22,21 @@ import (
 	"strconv"
 	"strings"
 
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	"github.com/projectcalico/api/pkg/lib/numorstring"
 	log "github.com/sirupsen/logrus"
+	wireguard "golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 	"gopkg.in/go-playground/validator.v9"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8svalidation "k8s.io/apimachinery/pkg/util/validation"
 
-	wireguard "golang.zx2c4.com/wireguard/wgctrl/wgtypes"
-
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-	"github.com/projectcalico/api/pkg/lib/numorstring"
-
 	libapi "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	calicoconversion "github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
 	"github.com/projectcalico/calico/libcalico-go/lib/errors"
+	"github.com/projectcalico/calico/libcalico-go/lib/names"
 	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
 	"github.com/projectcalico/calico/libcalico-go/lib/selector"
+	"github.com/projectcalico/calico/libcalico-go/lib/selector/tokenizer"
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
 )
 
@@ -61,31 +62,37 @@ var (
 	// more restrictive naming requirements.
 	nameRegex = regexp.MustCompile("^" + nameSubdomainFmt + "$")
 
+	// Tiers must have simple names with no dots, since they appear as sub-components of other
+	// names.
+	tierNameRegex = regexp.MustCompile("^" + nameLabelFmt + "$")
+
 	containerIDFmt   = "[a-zA-Z0-9]([-a-zA-Z0-9]*[a-zA-Z0-9])?"
 	containerIDRegex = regexp.MustCompile("^" + containerIDFmt + "$")
 
 	// NetworkPolicy names must either be a simple DNS1123 label format (nameLabelFmt), or
+	// nameLabelFmt.nameLabelFmt (with a single dot), or
 	// must be the standard name format (nameRegex) prefixed with "knp.default" or "ossg.default".
-	networkPolicyNameRegex = regexp.MustCompile("^((" + nameLabelFmt + ")|((?:knp|ossg)\\.default\\.(" + nameSubdomainFmt + ")))$")
+	networkPolicyNameRegex = regexp.MustCompile("^((" + nameLabelFmt + ")(\\." + nameLabelFmt + ")?|((?:knp|ossg)\\.default\\.(" + nameSubdomainFmt + ")))$")
 
-	// GlobalNetworkPolicy names must be a simple DNS1123 label format (nameLabelFmt).
-	globalNetworkPolicyNameRegex = regexp.MustCompile("^(" + nameLabelFmt + ")$")
+	// GlobalNetworkPolicy names must be a simple DNS1123 label format (nameLabelFmt) or
+	// have a single dot.
+	globalNetworkPolicyNameRegex = regexp.MustCompile("^(" + nameLabelFmt + "\\.)?" + nameLabelFmt + "$")
 
 	// Hostname  have to be valid ipv4, ipv6 or strings up to 64 characters.
 	prometheusHostRegexp = regexp.MustCompile(`^[a-zA-Z0-9:._+-]{1,64}$`)
 
-	// global() cannot be used with other selectors.
-	andOr               = `(&&|\|\|)`
-	globalSelectorRegex = regexp.MustCompile(fmt.Sprintf(`%v global\(\)|global\(\) %v`, andOr, andOr))
-
 	interfaceRegex          = regexp.MustCompile("^[a-zA-Z0-9_.-]{1,15}$")
 	bgpFilterInterfaceRegex = regexp.MustCompile("^[a-zA-Z0-9_.*-]{1,15}$")
+	bgpFilterPrefixLengthV4 = regexp.MustCompile("^([0-9]|[12][0-9]|3[0-2])$")
+	bgpFilterPrefixLengthV6 = regexp.MustCompile("^([0-9]|[1-9][0-9]|1[0-1][0-9]|12[0-8])$")
 	ignoredInterfaceRegex   = regexp.MustCompile("^[a-zA-Z0-9_.*-]{1,15}$")
 	ifaceFilterRegex        = regexp.MustCompile("^[a-zA-Z0-9:._+-]{1,15}$")
 	actionRegex             = regexp.MustCompile("^(Allow|Deny|Log|Pass)$")
 	protocolRegex           = regexp.MustCompile("^(TCP|UDP|ICMP|ICMPv6|SCTP|UDPLite)$")
 	ipipModeRegex           = regexp.MustCompile("^(Always|CrossSubnet|Never)$")
 	vxlanModeRegex          = regexp.MustCompile("^(Always|CrossSubnet|Never)$")
+	assignmentModeRegex     = regexp.MustCompile("^(Automatic|Manual)$")
+	assignIPsRegex          = regexp.MustCompile("^(AllServices|RequestedServicesOnly)$")
 	logLevelRegex           = regexp.MustCompile("^(Debug|Info|Warning|Error|Fatal)$")
 	bpfLogLevelRegex        = regexp.MustCompile("^(Debug|Info|Off)$")
 	bpfServiceModeRegex     = regexp.MustCompile("^(Tunnel|DSR)$")
@@ -129,6 +136,9 @@ var (
 
 	// reserved linux kernel routing tables (cannot be targeted by routeTableRanges)
 	routeTablesReservedLinux = []int{253, 254, 255}
+
+	stagedActionRegex = regexp.MustCompile("^(" + string(api.StagedActionSet) + "|" + string(api.StagedActionDelete) +
+		"|" + string(api.StagedActionLearn) + "|" + string(api.StagedActionIgnore) + ")$")
 )
 
 // Validate is used to validate the supplied structure according to the
@@ -163,6 +173,8 @@ func init() {
 	registerFieldValidator("action", validateAction)
 	registerFieldValidator("interface", validateInterface)
 	registerFieldValidator("bgpFilterInterface", validateBGPFilterInterface)
+	registerFieldValidator("bgpFilterPrefixLengthV4", validateBGPFilterPrefixLengthV4)
+	registerFieldValidator("bgpFilterPrefixLengthV6", validateBGPFilterPrefixLengthV6)
 	registerFieldValidator("ignoredInterface", validateIgnoredInterface)
 	registerFieldValidator("datastoreType", validateDatastoreType)
 	registerFieldValidator("name", validateName)
@@ -171,7 +183,10 @@ func init() {
 	registerFieldValidator("labels", validateLabels)
 	registerFieldValidator("ipVersion", validateIPVersion)
 	registerFieldValidator("ipIpMode", validateIPIPMode)
+	registerFieldValidator("stagedAction", validateStagedAction)
 	registerFieldValidator("vxlanMode", validateVXLANMode)
+	registerFieldValidator("assignmentMode", validateAssignmentMode)
+	registerFieldValidator("assignIPs", validateAssignIPs)
 	registerFieldValidator("policyType", validatePolicyType)
 	registerFieldValidator("logLevel", validateLogLevel)
 	registerFieldValidator("bpfLogLevel", validateBPFLogLevel)
@@ -233,6 +248,7 @@ func init() {
 	registerStructValidator(validate, validateNodeSpec, libapi.NodeSpec{})
 	registerStructValidator(validate, validateIPAMConfigSpec, libapi.IPAMConfigSpec{})
 	registerStructValidator(validate, validateObjectMeta, metav1.ObjectMeta{})
+	registerStructValidator(validate, validateTier, api.Tier{})
 	registerStructValidator(validate, validateHTTPRule, api.HTTPMatch{})
 	registerStructValidator(validate, validateFelixConfigSpec, api.FelixConfigurationSpec{})
 	registerStructValidator(validate, validateWorkloadEndpointSpec, libapi.WorkloadEndpointSpec{})
@@ -244,6 +260,9 @@ func init() {
 	registerStructValidator(validate, validateBGPFilterRuleV6, api.BGPFilterRuleV6{})
 	registerStructValidator(validate, validateNetworkPolicy, api.NetworkPolicy{})
 	registerStructValidator(validate, validateGlobalNetworkPolicy, api.GlobalNetworkPolicy{})
+	registerStructValidator(validate, validateStagedGlobalNetworkPolicy, api.StagedGlobalNetworkPolicy{})
+	registerStructValidator(validate, validateStagedNetworkPolicy, api.StagedNetworkPolicy{})
+	registerStructValidator(validate, validateStagedKubernetesNetworkPolicy, api.StagedKubernetesNetworkPolicy{})
 	registerStructValidator(validate, validateGlobalNetworkSet, api.GlobalNetworkSet{})
 	registerStructValidator(validate, validateNetworkSet, api.NetworkSet{})
 	registerStructValidator(validate, validateRuleMetadata, api.RuleMetadata{})
@@ -300,6 +319,18 @@ func validateBGPFilterInterface(fl validator.FieldLevel) bool {
 	s := fl.Field().String()
 	log.Debugf("Validate BGPFilter rule interface: %s", s)
 	return s == "*" || bgpFilterInterfaceRegex.MatchString(s)
+}
+
+func validateBGPFilterPrefixLengthV4(fl validator.FieldLevel) bool {
+	s := fmt.Sprint(fl.Field())
+	log.Debugf("Validate BGPFilter PrefixLength v4: %s", s)
+	return s == "*" || bgpFilterPrefixLengthV4.MatchString(s)
+}
+
+func validateBGPFilterPrefixLengthV6(fl validator.FieldLevel) bool {
+	s := fmt.Sprint(fl.Field())
+	log.Debugf("Validate BGPFilter PrefixLength v6: %s", s)
+	return s == "*" || bgpFilterPrefixLengthV6.MatchString(s)
 }
 
 func validateIgnoredInterface(fl validator.FieldLevel) bool {
@@ -423,10 +454,28 @@ func validateIPType(fl validator.FieldLevel) bool {
 	return ipTypeRegex.MatchString(s)
 }
 
+func validateStagedAction(fl validator.FieldLevel) bool {
+	s := fl.Field().String()
+	log.Debugf("Validate StagedAction Mode: %s", s)
+	return stagedActionRegex.MatchString(s)
+}
+
 func validateVXLANMode(fl validator.FieldLevel) bool {
 	s := fl.Field().String()
 	log.Debugf("Validate VXLAN Mode: %s", s)
 	return vxlanModeRegex.MatchString(s)
+}
+
+func validateAssignmentMode(fl validator.FieldLevel) bool {
+	s := fl.Field().String()
+	log.Debugf("Validate Assignemnt Mode: %s", s)
+	return assignmentModeRegex.MatchString(s)
+}
+
+func validateAssignIPs(fl validator.FieldLevel) bool {
+	s := fl.Field().String()
+	log.Debugf("Validate Assign IPs: %s", s)
+	return assignIPsRegex.MatchString(s)
 }
 
 func RegexValidator(desc string, rx *regexp.Regexp) func(fl validator.FieldLevel) bool {
@@ -453,7 +502,7 @@ func ValidateMAC(mac string) error {
 }
 
 func validateIptablesBackend(fl validator.FieldLevel) bool {
-	s := fl.Field().String()
+	s := api.IptablesBackend(fl.Field().String())
 	log.Debugf("Validate Iptables Backend: %s", s)
 	return s == "" || s == api.IptablesBackendAuto || s == api.IptablesBackendNFTables || s == api.IptablesBackendLegacy
 }
@@ -528,7 +577,7 @@ func validateSelector(fl validator.FieldLevel) bool {
 	log.Debugf("Validate selector: %s", s)
 
 	// We use the selector parser to validate a selector string.
-	_, err := selector.Parse(s)
+	err := selector.Validate(s)
 	if err != nil {
 		log.Debugf("Selector %#v was invalid: %v", s, err)
 		return false
@@ -606,7 +655,7 @@ func ValidateIPv4Network(addr string) error {
 	return fmt.Errorf("Invalid IPv4 network %s", addr)
 }
 
-// validateIPv4Network validates the field is a valid (strictly masked) IPv6 network.
+// validateIPv6Network validates the field is a valid (strictly masked) IPv6 network.
 // An IP address is valid, and assumed to be fully masked (i.e /128)
 func validateIPv6Network(fl validator.FieldLevel) bool {
 	n := fl.Field().String()
@@ -1071,6 +1120,13 @@ func validateIPPoolSpec(structLevel validator.StructLevel) {
 	// Normalize the CIDR before persisting.
 	pool.CIDR = cidr.String()
 
+	isLoadBalancer := false
+	for _, u := range pool.AllowedUses {
+		if u == api.IPPoolAllowedUseLoadBalancer {
+			isLoadBalancer = true
+		}
+	}
+
 	// IPIP cannot be enabled for IPv6.
 	if cidr.Version() == 6 && pool.IPIPMode != api.IPIPModeNever {
 		structLevel.ReportError(reflect.ValueOf(pool.IPIPMode),
@@ -1080,7 +1136,13 @@ func validateIPPoolSpec(structLevel validator.StructLevel) {
 	// Cannot have both VXLAN and IPIP on the same IP pool.
 	if ipipModeEnabled(pool.IPIPMode) && vxLanModeEnabled(pool.VXLANMode) {
 		structLevel.ReportError(reflect.ValueOf(pool.IPIPMode),
-			"IPpool.IPIPMode", "", reason("IPIPMode and VXLANMode cannot both be enabled on the same IP pool"), "")
+			"IPpool.IPIPMode", "", reason("IPIPMode and VXLANMode cannot be enabled on LoadBalancer IP pool"), "")
+	}
+
+	// Cannot have VXLAN or IPIP enabled on LoadBalancer IP pool.
+	if isLoadBalancer && (ipipModeEnabled(pool.IPIPMode) || vxLanModeEnabled(pool.VXLANMode)) {
+		structLevel.ReportError(reflect.ValueOf(pool.IPIPMode),
+			"IPpool.IPIPMode", "", reason("Neither IPIPMode nor VXLANMode can be enabled on AllowedUses LoadBalancer IP pool"), "")
 	}
 
 	// Default the blockSize
@@ -1135,12 +1197,28 @@ func validateIPPoolSpec(structLevel validator.StructLevel) {
 	// Allowed use must be one of the enums.
 	for _, a := range pool.AllowedUses {
 		switch a {
+		case api.IPPoolAllowedUseLoadBalancer:
+			continue
 		case api.IPPoolAllowedUseWorkload, api.IPPoolAllowedUseTunnel:
+			if isLoadBalancer {
+				structLevel.ReportError(reflect.ValueOf(pool.AllowedUses),
+					"IPpool.AllowedUses", "", reason("LoadBalancer cannot be used at the same time as: "+string(a)), "")
+			}
 			continue
 		default:
 			structLevel.ReportError(reflect.ValueOf(pool.AllowedUses),
 				"IPpool.AllowedUses", "", reason("unknown use: "+string(a)), "")
 		}
+	}
+
+	if isLoadBalancer && pool.DisableBGPExport {
+		structLevel.ReportError(reflect.ValueOf(pool.CIDR),
+			"IPpool.DisableBGPExport", "", reason("IP Pool with AllowedUse LoadBalancer must have DisableBGPExport set to true"), "")
+	}
+
+	if isLoadBalancer && pool.NodeSelector != "all()" {
+		structLevel.ReportError(reflect.ValueOf(pool.CIDR),
+			"IPpool.NodeSelector", "", reason("IP Pool with AllowedUse LoadBalancer must have node selector set to all()"), "")
 	}
 }
 
@@ -1270,17 +1348,17 @@ func validateEntityRule(structLevel validator.StructLevel) {
 			"Selector field", "", reason(globalSelectorEntRule), "")
 	}
 
-	// Get the parsed and canonicalised string of the namespaceSelector
-	// so we can make assertions against it.
-	// Note: err can be ignored; the field is validated separately and before
-	// this point.
-	n, _ := selector.Parse(rule.NamespaceSelector)
-	namespaceSelector := n.String()
-
-	// If the namespaceSelector contains global(), then it should be the only selector.
-	if globalSelectorRegex.MatchString(namespaceSelector) {
-		structLevel.ReportError(reflect.ValueOf(rule.NamespaceSelector),
-			"NamespaceSelector field", "", reason(globalSelectorOnly), "")
+	if strings.Contains(rule.NamespaceSelector, "global(") &&
+		rule.NamespaceSelector != "global()" {
+		// Looks like the selector has a global() clause but it's not _only_
+		// that.  Tokenize the selector so we can more easily check it.
+		var tokenArr [16]tokenizer.Token
+		tokens, err := tokenizer.AppendTokens(tokenArr[:0], rule.NamespaceSelector)
+		if err != nil || len(tokens) > 2 || tokens[0].Kind != tokenizer.TokGlobal {
+			// If the namespaceSelector contains global(), then it should be the only selector.
+			structLevel.ReportError(reflect.ValueOf(rule.NamespaceSelector),
+				"NamespaceSelector field", "", reason(globalSelectorOnly), "")
+		}
 	}
 
 	if rule.Services != nil {
@@ -1395,15 +1473,21 @@ func validateReachableByField(fl validator.FieldLevel) bool {
 
 func validateBGPFilterRuleV4(structLevel validator.StructLevel) {
 	fs := structLevel.Current().Interface().(api.BGPFilterRuleV4)
-	validateBGPFilterRule(structLevel, fs.CIDR, fs.MatchOperator)
+	validateBGPFilterRule(structLevel, fs.CIDR, fs.MatchOperator, fs.PrefixLength, nil)
 }
 
 func validateBGPFilterRuleV6(structLevel validator.StructLevel) {
 	fs := structLevel.Current().Interface().(api.BGPFilterRuleV6)
-	validateBGPFilterRule(structLevel, fs.CIDR, fs.MatchOperator)
+	validateBGPFilterRule(structLevel, fs.CIDR, fs.MatchOperator, nil, fs.PrefixLength)
 }
 
-func validateBGPFilterRule(structLevel validator.StructLevel, cidr string, op api.BGPFilterMatchOperator) {
+func validateBGPFilterRule(
+	structLevel validator.StructLevel,
+	cidr string,
+	op api.BGPFilterMatchOperator,
+	prefixLengthV4 *api.BGPFilterPrefixLengthV4,
+	prefixLengthV6 *api.BGPFilterPrefixLengthV6,
+) {
 	if cidr != "" && op == "" {
 		structLevel.ReportError(cidr, "CIDR", "",
 			reason("MatchOperator cannot be empty when CIDR is not"), "")
@@ -1411,6 +1495,14 @@ func validateBGPFilterRule(structLevel validator.StructLevel, cidr string, op ap
 	if cidr == "" && op != "" {
 		structLevel.ReportError(op, "MatchOperator", "",
 			reason("CIDR cannot be empty when MatchOperator is not"), "")
+	}
+	if cidr == "" && prefixLengthV4 != nil {
+		structLevel.ReportError(prefixLengthV4, "PrefixLength", "",
+			reason("CIDR cannot be empty when PrefixLength is not"), "")
+	}
+	if cidr == "" && prefixLengthV6 != nil {
+		structLevel.ReportError(prefixLengthV6, "PrefixLength", "",
+			reason("CIDR cannot be empty when PrefixLength is not"), "")
 	}
 }
 
@@ -1496,10 +1588,74 @@ func validateObjectMeta(structLevel validator.StructLevel) {
 	validateObjectMetaLabels(structLevel, om.Labels)
 }
 
-func validateNetworkPolicy(structLevel validator.StructLevel) {
-	np := structLevel.Current().Interface().(api.NetworkPolicy)
-	spec := np.Spec
+func validateTier(structLevel validator.StructLevel) {
+	tier := structLevel.Current().Interface().(api.Tier)
 
+	// Check the name is within the max length.
+	// Tier names are dependent on the label max length since policy lookup by tier in KDD requires the name to fit in a label.
+	if len(tier.Name) > k8svalidation.DNS1123LabelMaxLength {
+		structLevel.ReportError(
+			reflect.ValueOf(tier.Name),
+			"Metadata.Name",
+			"",
+			reason(fmt.Sprintf("name is too long by %d bytes", len(tier.Name)-k8svalidation.DNS1123LabelMaxLength)),
+			"",
+		)
+	}
+
+	// Tiers must have simple (no dot) names, since they appear as sub-components of other names.
+	matched := tierNameRegex.MatchString(tier.Name)
+	if !matched {
+		structLevel.ReportError(
+			reflect.ValueOf(tier.Name),
+			"Metadata.Name",
+			"",
+			reason("name must consist of lower case alphanumeric characters or '-' (regex: "+nameLabelFmt+")"),
+			"",
+		)
+	}
+
+	if tier.Name == names.DefaultTierName {
+		if tier.Spec.Order == nil || *tier.Spec.Order != api.DefaultTierOrder {
+			structLevel.ReportError(
+				reflect.ValueOf(tier.Spec.Order),
+				"TierSpec.Order",
+				"",
+				reason(fmt.Sprintf("default tier order must be %v", api.DefaultTierOrder)),
+				"",
+			)
+		}
+	}
+
+	if tier.Name == names.AdminNetworkPolicyTierName {
+		if tier.Spec.Order == nil || *tier.Spec.Order != api.AdminNetworkPolicyTierOrder {
+			structLevel.ReportError(
+				reflect.ValueOf(tier.Spec.Order),
+				"TierSpec.Order",
+				"",
+				reason(fmt.Sprintf("adminnetworkpolicy tier order must be %v", api.AdminNetworkPolicyTierOrder)),
+				"",
+			)
+		}
+	}
+
+	if tier.Name == names.BaselineAdminNetworkPolicyTierName {
+		if tier.Spec.Order == nil || *tier.Spec.Order != api.BaselineAdminNetworkPolicyTierOrder {
+			structLevel.ReportError(
+				reflect.ValueOf(tier.Spec.Order),
+				"TierSpec.Order",
+				"",
+				reason(fmt.Sprintf("baselineadminnetworkpolicy tier order must be %v", api.BaselineAdminNetworkPolicyTierOrder)),
+				"",
+			)
+		}
+	}
+
+	validateObjectMetaAnnotations(structLevel, tier.Annotations)
+	validateObjectMetaLabels(structLevel, tier.Labels)
+}
+
+func validateNetworkPolicySpec(spec *api.NetworkPolicySpec, structLevel validator.StructLevel) {
 	// Check (and disallow) any repeats in Types field.
 	mp := map[api.PolicyType]bool{}
 	for _, t := range spec.Types {
@@ -1510,32 +1666,6 @@ func validateNetworkPolicy(structLevel validator.StructLevel) {
 			mp[t] = true
 		}
 	}
-
-	// Check the name is within the max length.
-	if len(np.Name) > k8svalidation.DNS1123SubdomainMaxLength {
-		structLevel.ReportError(
-			reflect.ValueOf(np.Name),
-			"Metadata.Name",
-			"",
-			reason(fmt.Sprintf("name is too long by %d bytes", len(np.Name)-k8svalidation.DNS1123SubdomainMaxLength)),
-			"",
-		)
-	}
-
-	// Uses the k8s DN1123 label format for policy names (plus knp.default prefixed k8s policies).
-	matched := networkPolicyNameRegex.MatchString(np.Name)
-	if !matched {
-		structLevel.ReportError(
-			reflect.ValueOf(np.Name),
-			"Metadata.Name",
-			"",
-			reason("name must consist of lower case alphanumeric characters or '-' (regex: "+nameLabelFmt+")"),
-			"",
-		)
-	}
-
-	validateObjectMetaAnnotations(structLevel, np.Annotations)
-	validateObjectMetaLabels(structLevel, np.Labels)
 
 	for _, r := range spec.Egress {
 		// Services are only allowed in the destination on Egress rules.
@@ -1584,6 +1714,82 @@ func validateNetworkPolicy(structLevel validator.StructLevel) {
 	}
 }
 
+func validateNetworkPolicy(structLevel validator.StructLevel) {
+	np := structLevel.Current().Interface().(api.NetworkPolicy)
+	spec := np.Spec
+
+	// Check the name is within the max length.
+	if len(np.Name) > k8svalidation.DNS1123SubdomainMaxLength {
+		structLevel.ReportError(
+			reflect.ValueOf(np.Name),
+			"Metadata.Name",
+			"",
+			reason(fmt.Sprintf("name is too long by %d bytes", len(np.Name)-k8svalidation.DNS1123SubdomainMaxLength)),
+			"",
+		)
+	}
+
+	// Uses the k8s DN1123 label format for policy names (plus knp.default prefixed k8s policies).
+	matched := networkPolicyNameRegex.MatchString(np.Name)
+	if !matched {
+		structLevel.ReportError(
+			reflect.ValueOf(np.Name),
+			"Metadata.Name",
+			"",
+			reason("name must consist of lower case alphanumeric characters or '-' (regex: "+nameLabelFmt+")"),
+			"",
+		)
+	}
+
+	validateObjectMetaAnnotations(structLevel, np.Annotations)
+	validateObjectMetaLabels(structLevel, np.Labels)
+
+	validateNetworkPolicySpec(&spec, structLevel)
+}
+
+func validateStagedNetworkPolicy(structLevel validator.StructLevel) {
+	staged := structLevel.Current().Interface().(api.StagedNetworkPolicy)
+
+	// Check the name is within the max length.
+	if len(staged.Name) > k8svalidation.DNS1123SubdomainMaxLength {
+		structLevel.ReportError(
+			reflect.ValueOf(staged.Name),
+			"Metadata.Name",
+			"",
+			reason(fmt.Sprintf("name is too long by %d bytes", len(staged.Name)-k8svalidation.DNS1123SubdomainMaxLength)),
+			"",
+		)
+	}
+
+	// Uses the k8s DN1123 label format for policy names (plus knp.default prefixed k8s policies).
+	matched := networkPolicyNameRegex.MatchString(staged.Name)
+	if !matched {
+		structLevel.ReportError(
+			reflect.ValueOf(staged.Name),
+			"Metadata.Name",
+			"",
+			reason("name must consist of lower case alphanumeric characters or '-' (regex: "+nameLabelFmt+")"),
+			"",
+		)
+	}
+
+	validateObjectMetaAnnotations(structLevel, staged.Annotations)
+	validateObjectMetaLabels(structLevel, staged.Labels)
+
+	_, enforced := api.ConvertStagedPolicyToEnforced(&staged)
+
+	if staged.Spec.StagedAction == api.StagedActionDelete {
+		empty := api.NetworkPolicySpec{}
+		empty.Tier = enforced.Spec.Tier
+		if !reflect.DeepEqual(empty, enforced.Spec) {
+			structLevel.ReportError(reflect.ValueOf(staged.Spec),
+				"StagedNetworkPolicySpec", "", reason("Spec fields, except Tier, should all be zero-value if stagedAction is Delete"), "")
+		}
+	} else {
+		validateNetworkPolicySpec(&enforced.Spec, structLevel)
+	}
+}
+
 func validateNetworkSet(structLevel validator.StructLevel) {
 	ns := structLevel.Current().Interface().(api.NetworkSet)
 	for k := range ns.GetLabels() {
@@ -1618,36 +1824,7 @@ func validateGlobalNetworkSet(structLevel validator.StructLevel) {
 	}
 }
 
-func validateGlobalNetworkPolicy(structLevel validator.StructLevel) {
-	gnp := structLevel.Current().Interface().(api.GlobalNetworkPolicy)
-	spec := gnp.Spec
-
-	// Check the name is within the max length.
-	if len(gnp.Name) > k8svalidation.DNS1123SubdomainMaxLength {
-		structLevel.ReportError(
-			reflect.ValueOf(gnp.Name),
-			"Metadata.Name",
-			"",
-			reason(fmt.Sprintf("name is too long by %d bytes", len(gnp.Name)-k8svalidation.DNS1123SubdomainMaxLength)),
-			"",
-		)
-	}
-
-	// Uses the k8s DN1123 label format for policy names.
-	matched := globalNetworkPolicyNameRegex.MatchString(gnp.Name)
-	if !matched {
-		structLevel.ReportError(
-			reflect.ValueOf(gnp.Name),
-			"Metadata.Name",
-			"",
-			reason("name must consist of lower case alphanumeric characters or '-' (regex: "+nameLabelFmt+")"),
-			"",
-		)
-	}
-
-	validateObjectMetaAnnotations(structLevel, gnp.Annotations)
-	validateObjectMetaLabels(structLevel, gnp.Labels)
-
+func validateGlobalNetworkPolicySpec(spec *api.GlobalNetworkPolicySpec, structLevel validator.StructLevel) {
 	if spec.DoNotTrack && spec.PreDNAT {
 		structLevel.ReportError(reflect.ValueOf(spec.PreDNAT),
 			"PolicySpec.PreDNAT", "", reason("PreDNAT and DoNotTrack cannot both be true, for a given PolicySpec"), "")
@@ -1755,6 +1932,126 @@ func validateGlobalNetworkPolicy(structLevel validator.StructLevel) {
 			"",
 			reason(globalSelectorEntRule),
 			"")
+	}
+}
+
+func validateGlobalNetworkPolicy(structLevel validator.StructLevel) {
+	gnp := structLevel.Current().Interface().(api.GlobalNetworkPolicy)
+	spec := gnp.Spec
+
+	// Check the name is within the max length.
+	if len(gnp.Name) > k8svalidation.DNS1123SubdomainMaxLength {
+		structLevel.ReportError(
+			reflect.ValueOf(gnp.Name),
+			"Metadata.Name",
+			"",
+			reason(fmt.Sprintf("name is too long by %d bytes", len(gnp.Name)-k8svalidation.DNS1123SubdomainMaxLength)),
+			"",
+		)
+	}
+
+	// Uses the k8s DN1123 label format for policy names.
+	matched := globalNetworkPolicyNameRegex.MatchString(gnp.Name)
+	if !matched {
+		structLevel.ReportError(
+			reflect.ValueOf(gnp.Name),
+			"Metadata.Name",
+			"",
+			reason("name must consist of lower case alphanumeric characters or '-' (regex: "+nameLabelFmt+")"),
+			"",
+		)
+	}
+
+	validateObjectMetaAnnotations(structLevel, gnp.Annotations)
+	validateObjectMetaLabels(structLevel, gnp.Labels)
+	validateGlobalNetworkPolicySpec(&spec, structLevel)
+}
+
+func validateStagedGlobalNetworkPolicy(structLevel validator.StructLevel) {
+	staged := structLevel.Current().Interface().(api.StagedGlobalNetworkPolicy)
+
+	// Check the name is within the max length.
+	if len(staged.Name) > k8svalidation.DNS1123SubdomainMaxLength {
+		structLevel.ReportError(
+			reflect.ValueOf(staged.Name),
+			"Metadata.Name",
+			"",
+			reason(fmt.Sprintf("name is too long by %d bytes", len(staged.Name)-k8svalidation.DNS1123SubdomainMaxLength)),
+			"",
+		)
+	}
+
+	// Uses the k8s DN1123 label format for policy names.
+	matched := globalNetworkPolicyNameRegex.MatchString(staged.Name)
+	if !matched {
+		structLevel.ReportError(
+			reflect.ValueOf(staged.Name),
+			"Metadata.Name",
+			"",
+			reason("name must consist of lower case alphanumeric characters or '-' (regex: "+nameLabelFmt+")"),
+			"",
+		)
+	}
+
+	validateObjectMetaAnnotations(structLevel, staged.Annotations)
+	validateObjectMetaLabels(structLevel, staged.Labels)
+
+	_, enforced := api.ConvertStagedGlobalPolicyToEnforced(&staged)
+
+	if staged.Spec.StagedAction == api.StagedActionDelete {
+		// the network policy fields should all "zero-value" when the update type is "delete"
+		empty := api.GlobalNetworkPolicySpec{}
+		empty.Tier = enforced.Spec.Tier
+		if !reflect.DeepEqual(empty, enforced.Spec) {
+			structLevel.ReportError(reflect.ValueOf(staged.Spec),
+				"StagedGlobalNetworkPolicySpec", "", reason("Spec fields, except Tier, should all be zero-value if stagedAction is Delete"), "")
+		}
+	} else {
+		validateGlobalNetworkPolicySpec(&enforced.Spec, structLevel)
+	}
+}
+
+func validateStagedKubernetesNetworkPolicy(structLevel validator.StructLevel) {
+	staged := structLevel.Current().Interface().(api.StagedKubernetesNetworkPolicy)
+
+	// Check the name is within the max length.
+	if len(staged.Name) > k8svalidation.DNS1123SubdomainMaxLength {
+		structLevel.ReportError(
+			reflect.ValueOf(staged.Name),
+			"Metadata.Name",
+			"",
+			reason(fmt.Sprintf("name is too long by %d bytes", len(staged.Name)-k8svalidation.DNS1123SubdomainMaxLength)),
+			"",
+		)
+	}
+
+	validateObjectMetaAnnotations(structLevel, staged.Annotations)
+	validateObjectMetaLabels(structLevel, staged.Labels)
+
+	if staged.Spec.StagedAction == api.StagedActionDelete {
+		// the network policy fields should all "zero-value" when the update type is "delete"
+		empty := api.NewStagedKubernetesNetworkPolicy()
+		empty.Spec.StagedAction = api.StagedActionDelete
+		if !reflect.DeepEqual(empty.Spec, staged.Spec) {
+			structLevel.ReportError(reflect.ValueOf(staged.Spec),
+				"StagedKubernetesNetworkPolicySpec", "", reason("Spec fields should all be zero-value if stagedAction is Delete"), "")
+		}
+	} else {
+		c := calicoconversion.NewConverter()
+		_, v1np := api.ConvertStagedKubernetesPolicyToK8SEnforced(&staged)
+		npKVPair, err := c.K8sNetworkPolicyToCalico(v1np)
+		if err != nil {
+			structLevel.ReportError(
+				reflect.ValueOf(staged.Spec),
+				"PolicySpec",
+				"",
+				reason(fmt.Sprintf("conversion to stagednetworkpolicy failed %v", err)),
+				"",
+			)
+		}
+
+		v3np := npKVPair.Value.(*api.NetworkPolicy)
+		validateNetworkPolicySpec(&v3np.Spec, structLevel)
 	}
 }
 

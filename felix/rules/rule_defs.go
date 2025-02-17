@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,9 +19,8 @@ import (
 	"reflect"
 	"strings"
 
-	log "github.com/sirupsen/logrus"
-
 	"github.com/projectcalico/api/pkg/lib/numorstring"
+	log "github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/felix/config"
 	"github.com/projectcalico/calico/felix/generictables"
@@ -29,6 +28,7 @@ import (
 	"github.com/projectcalico/calico/felix/iptables"
 	"github.com/projectcalico/calico/felix/nftables"
 	"github.com/projectcalico/calico/felix/proto"
+	"github.com/projectcalico/calico/felix/types"
 )
 
 const (
@@ -85,6 +85,9 @@ const (
 	ChainFromWorkloadDispatch = ChainNamePrefix + "from-wl-dispatch"
 	ChainToWorkloadDispatch   = ChainNamePrefix + "to-wl-dispatch"
 
+	NftablesToWorkloadDispatchMap   = ChainNamePrefix + "to-wl-dispatch"
+	NftablesFromWorkloadDispatchMap = ChainNamePrefix + "from-wl-dispatch"
+
 	ChainDispatchToHostEndpoint          = ChainNamePrefix + "to-host-endpoint"
 	ChainDispatchFromHostEndpoint        = ChainNamePrefix + "from-host-endpoint"
 	ChainDispatchToHostEndpointForward   = ChainNamePrefix + "to-hep-forward"
@@ -114,6 +117,16 @@ const (
 
 	RuleHashPrefix = "cali:"
 
+	// NFLOGPrefixMaxLength is NFLOG max prefix length which is 64 characters.
+	// Ref: http://ipset.netfilter.org/iptables-extensions.man.html#lbDI
+	NFLOGPrefixMaxLength = 64
+
+	// NFLOG groups. 1 for inbound and 2 for outbound.  3 for
+	// snooping DNS response for domain information.
+	NFLOGInboundGroup  uint16 = 1
+	NFLOGOutboundGroup uint16 = 2
+	NFLOGDomainGroup   uint16 = 3
+
 	// HistoricNATRuleInsertRegex is a regex pattern to match to match
 	// special-case rules inserted by old versions of felix.  Specifically,
 	// Python felix used to insert a masquerade rule directly into the
@@ -135,6 +148,67 @@ const (
 	PolicyDirectionInbound  PolicyDirection = "inbound"  // AKA ingress
 	PolicyDirectionOutbound PolicyDirection = "outbound" // AKA egress
 )
+
+type RuleAction byte
+
+const (
+	// We define these with specific byte values as we write this value directly into the NFLOG
+	// prefix.
+	RuleActionAllow RuleAction = 'A'
+	RuleActionDeny  RuleAction = 'D'
+	// Pass onto the next tier
+	RuleActionPass RuleAction = 'P'
+)
+
+func (r RuleAction) String() string {
+	switch r {
+	case RuleActionAllow:
+		return "Allow"
+	case RuleActionDeny:
+		return "Deny"
+	case RuleActionPass:
+		return "Pass"
+	}
+	return ""
+}
+
+type RuleDir byte
+
+const (
+	// We define these with specific byte values as we write this value directly into the NFLOG
+	// prefix.
+	RuleDirIngress RuleDir = 'I'
+	RuleDirEgress  RuleDir = 'E'
+)
+
+func (r RuleDir) String() string {
+	switch r {
+	case RuleDirIngress:
+		return "Ingress"
+	case RuleDirEgress:
+		return "Egress"
+	}
+	return ""
+}
+
+type RuleOwnerType byte
+
+const (
+	// We define these with specific byte values as we write this value directly into the NFLOG
+	// prefix.
+	RuleOwnerTypePolicy  RuleOwnerType = 'P'
+	RuleOwnerTypeProfile RuleOwnerType = 'R'
+)
+
+func (r RuleOwnerType) String() string {
+	switch r {
+	case RuleOwnerTypePolicy:
+		return "Policy"
+	case RuleOwnerTypeProfile:
+		return "Profile"
+	}
+	return ""
+}
 
 // Typedefs to prevent accidentally passing the wrong prefix to the Policy/ProfileChainName()
 type (
@@ -192,52 +266,56 @@ type RuleRenderer interface {
 	StaticMangleTableChains(ipVersion uint8) []*generictables.Chain
 	StaticFilterForwardAppendRules() []generictables.Rule
 
-	WorkloadDispatchChains(map[proto.WorkloadEndpointID]*proto.WorkloadEndpoint) []*generictables.Chain
-	WorkloadEndpointToIptablesChains(ifaceName string, epMarkMapper EndpointMarkMapper, adminUp bool, ingressPolicies []*PolicyGroup, egressPolicies []*PolicyGroup, profileIDs []string) []*generictables.Chain
+	DispatchMappings(map[types.WorkloadEndpointID]*proto.WorkloadEndpoint) (map[string][]string, map[string][]string)
+	WorkloadDispatchChains(map[types.WorkloadEndpointID]*proto.WorkloadEndpoint) []*generictables.Chain
+	WorkloadEndpointToIptablesChains(
+		ifaceName string,
+		epMarkMapper EndpointMarkMapper,
+		adminUp bool,
+		tiers []TierPolicyGroups,
+		profileIDs []string,
+	) []*generictables.Chain
 	PolicyGroupToIptablesChains(group *PolicyGroup) []*generictables.Chain
 
-	WorkloadInterfaceAllowChains(endpoints map[proto.WorkloadEndpointID]*proto.WorkloadEndpoint) []*generictables.Chain
+	WorkloadInterfaceAllowChains(endpoints map[types.WorkloadEndpointID]*proto.WorkloadEndpoint) []*generictables.Chain
 
 	EndpointMarkDispatchChains(
 		epMarkMapper EndpointMarkMapper,
-		wlEndpoints map[proto.WorkloadEndpointID]*proto.WorkloadEndpoint,
-		hepEndpoints map[string]proto.HostEndpointID,
+		wlEndpoints map[types.WorkloadEndpointID]*proto.WorkloadEndpoint,
+		hepEndpoints map[string]types.HostEndpointID,
 	) []*generictables.Chain
 
-	HostDispatchChains(map[string]proto.HostEndpointID, string, bool) []*generictables.Chain
-	FromHostDispatchChains(map[string]proto.HostEndpointID, string) []*generictables.Chain
-	ToHostDispatchChains(map[string]proto.HostEndpointID, string) []*generictables.Chain
+	HostDispatchChains(map[string]types.HostEndpointID, string, bool) []*generictables.Chain
+	FromHostDispatchChains(map[string]types.HostEndpointID, string) []*generictables.Chain
+	ToHostDispatchChains(map[string]types.HostEndpointID, string) []*generictables.Chain
 	HostEndpointToFilterChains(
 		ifaceName string,
+		tiers []TierPolicyGroups,
+		forwardTiers []TierPolicyGroups,
 		epMarkMapper EndpointMarkMapper,
-		ingressPolicies []*PolicyGroup,
-		egressPolicies []*PolicyGroup,
-		ingressForwardPolicies []*PolicyGroup,
-		egressForwardPolicies []*PolicyGroup,
 		profileIDs []string,
 	) []*generictables.Chain
 	HostEndpointToMangleEgressChains(
 		ifaceName string,
-		egressPolicies []*PolicyGroup,
+		tiers []TierPolicyGroups,
 		profileIDs []string,
 	) []*generictables.Chain
 	HostEndpointToRawEgressChain(
 		ifaceName string,
-		egressPolicies []*PolicyGroup,
+		untrackedTiers []TierPolicyGroups,
 	) *generictables.Chain
 	HostEndpointToRawChains(
 		ifaceName string,
-		ingressPolicies []*PolicyGroup,
-		egressPolicies []*PolicyGroup,
+		untrackedTiers []TierPolicyGroups,
 	) []*generictables.Chain
 	HostEndpointToMangleIngressChains(
 		ifaceName string,
-		preDNATPolicies []*PolicyGroup,
+		preDNATTiers []TierPolicyGroups,
 	) []*generictables.Chain
 
-	PolicyToIptablesChains(policyID *proto.PolicyID, policy *proto.Policy, ipVersion uint8) []*generictables.Chain
-	ProfileToIptablesChains(profileID *proto.ProfileID, policy *proto.Profile, ipVersion uint8) (inbound, outbound *generictables.Chain)
-	ProtoRuleToIptablesRules(pRule *proto.Rule, ipVersion uint8) []generictables.Rule
+	PolicyToIptablesChains(policyID *types.PolicyID, policy *proto.Policy, ipVersion uint8) []*generictables.Chain
+	ProfileToIptablesChains(profileID *types.ProfileID, policy *proto.Profile, ipVersion uint8) (inbound, outbound *generictables.Chain)
+	ProtoRuleToIptablesRules(pRule *proto.Rule, ipVersion uint8, owner RuleOwnerType, dir RuleDir, idx int, name string, untracked, staged bool) []generictables.Rule
 
 	MakeNatOutgoingRule(protocol string, action generictables.Action, ipVersion uint8) generictables.Rule
 	NATOutgoingChain(active bool, ipVersion uint8) *generictables.Chain
@@ -258,13 +336,15 @@ type DefaultRuleRenderer struct {
 	generictables.ActionFactory
 
 	Config
+
 	inputAcceptActions       []generictables.Action
 	filterAllowAction        generictables.Action
 	mangleAllowAction        generictables.Action
 	blockCIDRAction          generictables.Action
 	iptablesFilterDenyAction generictables.Action
 
-	NewMatch func() generictables.MatchCriteria
+	NewMatch       func() generictables.MatchCriteria
+	CombineMatches func(m1, m2 generictables.MatchCriteria) generictables.MatchCriteria
 
 	// wildcard is the symbol to use for wildcard matches.
 	wildcard string
@@ -294,14 +374,15 @@ type Config struct {
 
 	WorkloadIfacePrefixes []string
 
-	IptablesMarkAccept   uint32
-	IptablesMarkPass     uint32
-	IptablesMarkScratch0 uint32
-	IptablesMarkScratch1 uint32
-	IptablesMarkEndpoint uint32
-	// IptablesMarkNonCaliEndpoint is an endpoint mark which is reserved
+	MarkAccept   uint32
+	MarkPass     uint32
+	MarkDrop     uint32
+	MarkScratch0 uint32
+	MarkScratch1 uint32
+	MarkEndpoint uint32
+	// MarkNonCaliEndpoint is an endpoint mark which is reserved
 	// to mark non-calico (workload or host) endpoint.
-	IptablesMarkNonCaliEndpoint uint32
+	MarkNonCaliEndpoint uint32
 
 	KubeNodePortRanges     []numorstring.Port
 	KubeIPVSSupportEnabled bool
@@ -331,17 +412,17 @@ type Config struct {
 	WireguardEnabledV6          bool
 	WireguardInterfaceName      string
 	WireguardInterfaceNameV6    string
-	WireguardIptablesMark       uint32
+	WireguardMark               uint32
 	WireguardListeningPort      int
 	WireguardListeningPortV6    int
 	WireguardEncryptHostTraffic bool
 	RouteSource                 string
 
-	IptablesLogPrefix         string
-	EndpointToHostAction      string
-	IptablesFilterAllowAction string
-	IptablesMangleAllowAction string
-	IptablesFilterDenyAction  string
+	LogPrefix            string
+	EndpointToHostAction string
+	FilterAllowAction    string
+	MangleAllowAction    string
+	FilterDenyAction     string
 
 	FailsafeInboundHostPorts  []config.ProtoPort
 	FailsafeOutboundHostPorts []config.ProtoPort
@@ -360,10 +441,10 @@ type Config struct {
 }
 
 var unusedBitsInBPFMode = map[string]bool{
-	"IptablesMarkPass":            true,
-	"IptablesMarkScratch1":        true,
-	"IptablesMarkEndpoint":        true,
-	"IptablesMarkNonCaliEndpoint": true,
+	"MarkPass":            true,
+	"MarkScratch1":        true,
+	"MarkEndpoint":        true,
+	"MarkNonCaliEndpoint": true,
 }
 
 func (c *Config) validate() {
@@ -375,7 +456,7 @@ func (c *Config) validate() {
 	usedBits := uint32(0)
 	for i := 0; i < myValue.NumField(); i++ {
 		fieldName := myType.Field(i).Name
-		if strings.HasPrefix(fieldName, "IptablesMark") && fieldName != "IptablesMarkNonCaliEndpoint" {
+		if strings.HasPrefix(fieldName, "Mark") && fieldName != "MarkNonCaliEndpoint" {
 			if c.BPFEnabled && unusedBitsInBPFMode[fieldName] {
 				log.WithField("field", fieldName).Debug("Ignoring unused field in BPF mode.")
 				continue
@@ -383,11 +464,11 @@ func (c *Config) validate() {
 			bits := myValue.Field(i).Interface().(uint32)
 			if bits == 0 {
 				log.WithField("field", fieldName).Panic(
-					"IptablesMarkXXX field not set.")
+					"MarkXXX field not set.")
 			}
 			if usedBits&bits > 0 {
 				log.WithField("field", fieldName).Panic(
-					"IptablesMarkXXX field overlapped with another's bits.")
+					"MarkXXX field overlapped with another's bits.")
 			}
 			usedBits |= bits
 			found++
@@ -395,7 +476,7 @@ func (c *Config) validate() {
 	}
 	if found == 0 {
 		// Check the reflection found something we were expecting.
-		log.Panic("Didn't find any IptablesMarkXXX fields.")
+		log.Panic("Didn't find any MarkXXX fields.")
 	}
 }
 
@@ -423,10 +504,14 @@ func NewRenderer(config Config) RuleRenderer {
 		}
 		return iptables.Match()
 	}
+	combineMatches := iptables.Combine
+	if config.NFTables {
+		combineMatches = nftables.Combine
+	}
 
 	// First, what should we do when packets are not accepted.
 	var iptablesFilterDenyAction generictables.Action
-	switch config.IptablesFilterDenyAction {
+	switch config.FilterDenyAction {
 	case "REJECT":
 		log.Info("packets that are not passed by any policy or profile will be rejected.")
 		iptablesFilterDenyAction = reject
@@ -455,7 +540,7 @@ func NewRenderer(config Config) RuleRenderer {
 
 	// What should we do with packets that are accepted in the forwarding chain
 	var filterAllowAction, mangleAllowAction generictables.Action
-	switch config.IptablesFilterAllowAction {
+	switch config.FilterAllowAction {
 	case "RETURN":
 		log.Info("filter table allowed packets will be returned to FORWARD chain.")
 		filterAllowAction = ret
@@ -463,7 +548,7 @@ func NewRenderer(config Config) RuleRenderer {
 		log.Info("filter table allowed packets will be accepted immediately.")
 		filterAllowAction = accept
 	}
-	switch config.IptablesMangleAllowAction {
+	switch config.MangleAllowAction {
 	case "RETURN":
 		log.Info("mangle table allowed packets will be returned to PREROUTING chain.")
 		mangleAllowAction = ret
@@ -503,5 +588,6 @@ func NewRenderer(config Config) RuleRenderer {
 		iptablesFilterDenyAction: iptablesFilterDenyAction,
 		wildcard:                 wildcard,
 		maxNameLength:            maxNameLength,
+		CombineMatches:           combineMatches,
 	}
 }

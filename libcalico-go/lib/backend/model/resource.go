@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,12 +20,10 @@ import (
 	"regexp"
 	"strings"
 
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	log "github.com/sirupsen/logrus"
-
 	kapiv1 "k8s.io/api/core/v1"
 	discovery "k8s.io/api/discovery/v1"
-
-	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
 	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
 	"github.com/projectcalico/calico/libcalico-go/lib/namespace"
@@ -59,6 +57,14 @@ func registerResourceInfo(kind string, plural string, typeOf reflect.Type) {
 	resourceInfoByPlural[plural] = ri
 }
 
+func AllResourcePlurals() []string {
+	plurals := make([]string, 0, len(resourceInfoByPlural))
+	for plural := range resourceInfoByPlural {
+		plurals = append(plurals, plural)
+	}
+	return plurals
+}
+
 func init() {
 	registerResourceInfo(
 		apiv3.KindBGPPeer,
@@ -86,6 +92,11 @@ func init() {
 		reflect.TypeOf(apiv3.GlobalNetworkPolicy{}),
 	)
 	registerResourceInfo(
+		apiv3.KindStagedGlobalNetworkPolicy,
+		"stagedglobalnetworkpolicies",
+		reflect.TypeOf(apiv3.StagedGlobalNetworkPolicy{}),
+	)
+	registerResourceInfo(
 		apiv3.KindHostEndpoint,
 		"hostendpoints",
 		reflect.TypeOf(apiv3.HostEndpoint{}),
@@ -94,6 +105,16 @@ func init() {
 		apiv3.KindGlobalNetworkSet,
 		"globalnetworksets",
 		reflect.TypeOf(apiv3.GlobalNetworkSet{}),
+	)
+	registerResourceInfo(
+		KindKubernetesAdminNetworkPolicy,
+		"kubernetesadminnetworkpolicies",
+		reflect.TypeOf(apiv3.GlobalNetworkPolicy{}),
+	)
+	registerResourceInfo(
+		KindKubernetesBaselineAdminNetworkPolicy,
+		"kubernetesbaselineadminnetworkpolicies",
+		reflect.TypeOf(apiv3.GlobalNetworkPolicy{}),
 	)
 	registerResourceInfo(
 		apiv3.KindIPPool,
@@ -111,9 +132,19 @@ func init() {
 		reflect.TypeOf(apiv3.NetworkPolicy{}),
 	)
 	registerResourceInfo(
+		apiv3.KindStagedNetworkPolicy,
+		"stagednetworkpolicies",
+		reflect.TypeOf(apiv3.StagedNetworkPolicy{}),
+	)
+	registerResourceInfo(
 		KindKubernetesNetworkPolicy,
 		"kubernetesnetworkpolicies",
 		reflect.TypeOf(apiv3.NetworkPolicy{}),
+	)
+	registerResourceInfo(
+		apiv3.KindStagedKubernetesNetworkPolicy,
+		"stagedkubernetesnetworkpolicies",
+		reflect.TypeOf(apiv3.StagedKubernetesNetworkPolicy{}),
 	)
 	registerResourceInfo(
 		KindKubernetesEndpointSlice,
@@ -124,6 +155,11 @@ func init() {
 		apiv3.KindNetworkSet,
 		"networksets",
 		reflect.TypeOf(apiv3.NetworkSet{}),
+	)
+	registerResourceInfo(
+		apiv3.KindTier,
+		"tiers",
+		reflect.TypeOf(apiv3.Tier{}),
 	)
 	registerResourceInfo(
 		libapiv3.KindNode,
@@ -202,7 +238,7 @@ func (key ResourceKey) defaultDeleteParentPaths() ([]string, error) {
 func (key ResourceKey) valueType() (reflect.Type, error) {
 	ri, ok := resourceInfoByKindLower[strings.ToLower(key.Kind)]
 	if !ok {
-		return nil, fmt.Errorf("Unexpected resource kind: " + key.Kind)
+		return nil, fmt.Errorf("unexpected resource kind: %s", key.Kind)
 	}
 	return ri.typeOf, nil
 }

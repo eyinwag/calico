@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -46,7 +46,14 @@ const (
 	OrchestratorDocker     = "libnetwork"
 	OrchestratorOpenStack  = "openstack"
 
+	// Label used to denote the Tier. This is added to policies by Calico so that label matches
+	// can be made for tiers.
+	LabelTier = "projectcalico.org/tier"
+
 	// Enum options for enable/disable fields
 	Enabled  = "Enabled"
 	Disabled = "Disabled"
+
+	// Host name used for Service LoadBalancer
+	VirtualLoadBalancer = "load-balancer"
 )

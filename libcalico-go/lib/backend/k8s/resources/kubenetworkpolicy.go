@@ -20,23 +20,22 @@ import (
 	"fmt"
 
 	log "github.com/sirupsen/logrus"
-
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
-	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
-
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
+	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
 )
 
 // NewKubernetesNetworkPolicyClient returns a new client for interacting with Kubernetes NetworkPolicy objects.
 // Note that this client is only intended for use by the felix syncer in KDD mode, and as such is largely unimplemented
 // except for the functions required by the syncer.
-func NewKubernetesNetworkPolicyClient(c *kubernetes.Clientset) K8sResourceClient {
+func NewKubernetesNetworkPolicyClient(c kubernetes.Interface) K8sResourceClient {
 	return &networkPolicyClient{
 		Converter: conversion.NewConverter(),
 		clientSet: c,
@@ -46,7 +45,7 @@ func NewKubernetesNetworkPolicyClient(c *kubernetes.Clientset) K8sResourceClient
 // Implements the api.Client interface for Kubernetes NetworkPolicy.
 type networkPolicyClient struct {
 	conversion.Converter
-	clientSet *kubernetes.Clientset
+	clientSet kubernetes.Interface
 }
 
 func (c *networkPolicyClient) Create(ctx context.Context, kvp *model.KVPair) (*model.KVPair, error) {
@@ -112,17 +111,16 @@ func (c *networkPolicyClient) List(ctx context.Context, list model.ListInterface
 	return pagedList(ctx, logContext, revision, list, convertFunc, listFunc)
 }
 
-func (c *networkPolicyClient) Watch(ctx context.Context, list model.ListInterface, revision string) (api.WatchInterface, error) {
-	// Build watch options to pass to k8s.
-	opts := metav1.ListOptions{Watch: true, AllowWatchBookmarks: false}
+func (c *networkPolicyClient) Watch(ctx context.Context, list model.ListInterface, options api.WatchOptions) (api.WatchInterface, error) {
+
 	_, ok := list.(model.ResourceListOptions)
 	if !ok {
 		return nil, fmt.Errorf("ListInterface is not a ResourceListOptions: %s", list)
 	}
 
-	opts.ResourceVersion = revision
-	log.Debugf("Watching Kubernetes NetworkPolicy at revision %q", revision)
-	k8sRawWatch, err := c.clientSet.NetworkingV1().NetworkPolicies("").Watch(ctx, opts)
+	k8sOpts := watchOptionsToK8sListOptions(options)
+	log.Debugf("Watching Kubernetes NetworkPolicy at revision %q", options.Revision)
+	k8sRawWatch, err := c.clientSet.NetworkingV1().NetworkPolicies("").Watch(ctx, k8sOpts)
 	if err != nil {
 		return nil, K8sErrorToCalico(err, list)
 	}

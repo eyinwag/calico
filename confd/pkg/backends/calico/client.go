@@ -26,17 +26,14 @@ import (
 	"strings"
 	"sync"
 
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	"github.com/projectcalico/api/pkg/lib/numorstring"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/confd/pkg/buildinfo"
 	"github.com/projectcalico/calico/confd/pkg/config"
 	logutils "github.com/projectcalico/calico/confd/pkg/log"
-
 	"github.com/projectcalico/calico/confd/pkg/resource/template"
-
-	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-	"github.com/projectcalico/api/pkg/lib/numorstring"
-
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
@@ -1266,9 +1263,13 @@ func (c *client) getServiceExternalIPsKVPair(v3res *apiv3.BGPConfiguration, key 
 	if v3res != nil && v3res.Spec.ServiceExternalIPs != nil && len(v3res.Spec.ServiceExternalIPs) != 0 {
 		// We wrap each Service external IP in a ServiceExternalIPBlock struct to
 		// achieve the desired API structure, unpack that.
-		ipCidrs := make([]string, len(v3res.Spec.ServiceExternalIPs))
-		for i, ipBlock := range v3res.Spec.ServiceExternalIPs {
-			ipCidrs[i] = ipBlock.CIDR
+		ipCidrs := make([]string, 0, len(v3res.Spec.ServiceExternalIPs))
+		for _, ipBlock := range v3res.Spec.ServiceExternalIPs {
+			if ipBlock.CIDR == "" {
+				// The CRD allows CIDR to be optional so we just ignore empty CIDRs.
+				continue
+			}
+			ipCidrs = append(ipCidrs, ipBlock.CIDR)
 		}
 		c.updateCache(api.UpdateTypeKVUpdated, getKVPair(svcExternalIPKey, strings.Join(ipCidrs, ",")))
 	} else {
@@ -1281,9 +1282,13 @@ func (c *client) getServiceLoadBalancerIPsKVPair(v3res *apiv3.BGPConfiguration, 
 	svcLoadBalancerIPKey := getBGPConfigKey("svc_loadbalancer_ips", key)
 
 	if v3res != nil && v3res.Spec.ServiceLoadBalancerIPs != nil && len(v3res.Spec.ServiceLoadBalancerIPs) != 0 {
-		ipCidrs := make([]string, len(v3res.Spec.ServiceLoadBalancerIPs))
-		for i, ipBlock := range v3res.Spec.ServiceLoadBalancerIPs {
-			ipCidrs[i] = ipBlock.CIDR
+		ipCidrs := make([]string, 0, len(v3res.Spec.ServiceLoadBalancerIPs))
+		for _, ipBlock := range v3res.Spec.ServiceLoadBalancerIPs {
+			if ipBlock.CIDR == "" {
+				// The CRD allows CIDR to be optional so we just ignore empty CIDRs.
+				continue
+			}
+			ipCidrs = append(ipCidrs, ipBlock.CIDR)
 		}
 		c.updateCache(api.UpdateTypeKVUpdated, getKVPair(svcLoadBalancerIPKey, strings.Join(ipCidrs, ",")))
 	} else {
@@ -1304,9 +1309,13 @@ func (c *client) getServiceClusterIPsKVPair(v3res *apiv3.BGPConfiguration, key i
 		if v3res != nil && v3res.Spec.ServiceClusterIPs != nil && len(v3res.Spec.ServiceClusterIPs) != 0 {
 			// We wrap each Service Cluster IP in a ServiceClusterIPBlock to
 			// achieve the desired API structure. This unpacks that.
-			ipCidrs := make([]string, len(v3res.Spec.ServiceClusterIPs))
-			for i, ipBlock := range v3res.Spec.ServiceClusterIPs {
-				ipCidrs[i] = ipBlock.CIDR
+			ipCidrs := make([]string, 0, len(v3res.Spec.ServiceClusterIPs))
+			for _, ipBlock := range v3res.Spec.ServiceClusterIPs {
+				if ipBlock.CIDR == "" {
+					// The CRD allows CIDR to be optional so we just ignore empty CIDRs.
+					continue
+				}
+				ipCidrs = append(ipCidrs, ipBlock.CIDR)
 			}
 			c.updateCache(api.UpdateTypeKVUpdated, getKVPair(svcInternalIPKey, strings.Join(ipCidrs, ",")))
 		} else {
@@ -1400,7 +1409,11 @@ func getCommunitiesArray(communitiesSet set.Set[string]) []string {
 }
 
 func (c *client) onExternalIPsUpdate(externalIPs []string) {
-	if err := c.updateGlobalRoutes(externalIPs, c.ExternalIPRouteIndex); err == nil {
+	// ExternalIPs which are single addresses need to be advertised from every node for services of type "Cluster"
+	// and from only individual nodes with service present for services of type "Local". Both of these will be handled
+	// within the routeGenerator and should not be exposed as globalRoutes.
+	globalExtIPs := filterNonSingleIPsFromCIDRs(externalIPs)
+	if err := c.updateGlobalRoutes(globalExtIPs, c.ExternalIPRouteIndex); err == nil {
 		c.externalIPs = externalIPs
 		c.externalIPNets = parseIPNets(c.externalIPs)
 		log.Infof("Updated with new external IP CIDRs: %s", externalIPs)
@@ -1423,16 +1436,7 @@ func (c *client) onLoadBalancerIPsUpdate(lbIPs []string) {
 	// However, we don't want to advertise single IPs in this way because it breaks any "local" type services the user creates,
 	// which should instead be advertised from only a subset of nodes.
 	// So, we handle advertisement of any single-addresses found in the config on a per-service basis from within the routeGenerator.
-	var globalLbIPs []string
-	for _, lbIP := range lbIPs {
-		if strings.Contains(lbIP, ":") {
-			if !strings.HasSuffix(lbIP, "/128") {
-				globalLbIPs = append(globalLbIPs, lbIP)
-			}
-		} else if !strings.HasSuffix(lbIP, "/32") {
-			globalLbIPs = append(globalLbIPs, lbIP)
-		}
-	}
+	globalLbIPs := filterNonSingleIPsFromCIDRs(lbIPs)
 	if err := c.updateGlobalRoutes(globalLbIPs, c.LoadBalancerIPRouteIndex); err == nil {
 		c.loadBalancerIPs = lbIPs
 		c.loadBalancerIPNets = parseIPNets(c.loadBalancerIPs)
@@ -1863,6 +1867,20 @@ func withDefault(val, dflt string) string {
 		return val
 	}
 	return dflt
+}
+
+func filterNonSingleIPsFromCIDRs(ipCidrs []string) []string {
+	var nonSingleIPs []string
+	for _, ip := range ipCidrs {
+		if strings.Contains(ip, ":") {
+			if !strings.HasSuffix(ip, "/128") {
+				nonSingleIPs = append(nonSingleIPs, ip)
+			}
+		} else if !strings.HasSuffix(ip, "/32") {
+			nonSingleIPs = append(nonSingleIPs, ip)
+		}
+	}
+	return nonSingleIPs
 }
 
 // Checks whether or not a key references sensitive information (like a BGP password) so that

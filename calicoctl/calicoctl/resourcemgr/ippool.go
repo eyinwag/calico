@@ -17,9 +17,8 @@ package resourcemgr
 import (
 	"context"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
@@ -32,7 +31,7 @@ func init() {
 		false,
 		[]string{"ippool", "ippools", "ipp", "ipps", "pool", "pools"},
 		[]string{"NAME", "CIDR", "SELECTOR"},
-		[]string{"NAME", "CIDR", "NAT", "IPIPMODE", "VXLANMODE", "DISABLED", "DISABLEBGPEXPORT", "SELECTOR"},
+		[]string{"NAME", "CIDR", "NAT", "IPIPMODE", "VXLANMODE", "DISABLED", "DISABLEBGPEXPORT", "SELECTOR", "ASSIGNMENTMODE"},
 		map[string]string{
 			"NAME":             "{{.ObjectMeta.Name}}",
 			"CIDR":             "{{.Spec.CIDR}}",
@@ -42,6 +41,7 @@ func init() {
 			"DISABLED":         "{{.Spec.Disabled}}",
 			"DISABLEBGPEXPORT": "{{.Spec.DisableBGPExport}}",
 			"SELECTOR":         "{{.Spec.NodeSelector}}",
+			"ASSIGNMENTMODE":   "{{.Spec.AssignmentMode}}",
 		},
 		func(ctx context.Context, client client.Interface, resource ResourceObject) (ResourceObject, error) {
 			r := resource.(*api.IPPool)
