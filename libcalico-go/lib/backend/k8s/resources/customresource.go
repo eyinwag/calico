@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2019,2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,9 +16,12 @@ package resources
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	log "github.com/sirupsen/logrus"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,15 +36,14 @@ import (
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
-	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
 )
 
 // customK8sResourceClient implements the K8sResourceClient interface and provides a generic
 // mechanism for a 1:1 mapping between a Calico Resource and an equivalent Kubernetes
 // custom resource type.
 type customK8sResourceClient struct {
-	clientSet  *kubernetes.Clientset
-	restClient *rest.RESTClient
+	clientSet  kubernetes.Interface
+	restClient rest.Interface
 
 	// Name of the CRD. Not used.
 	name string
@@ -100,7 +102,7 @@ func (c *customK8sResourceClient) Create(ctx context.Context, kvp *model.KVPair)
 	// Convert the KVPair to the K8s resource.
 	resIn, err := c.convertKVPairToResource(kvp)
 	if err != nil {
-		logContext.WithError(err).Debug("Error creating resource")
+		logContext.WithError(err).Debug("Error converting to k8s resource")
 		return nil, err
 	}
 
@@ -185,6 +187,56 @@ func (c *customK8sResourceClient) Update(ctx context.Context, kvp *model.KVPair)
 	kvp, err = c.convertResourceToKVPair(resOut)
 	if err != nil {
 		logContext.WithError(err).Debug("Error converting created K8s resource to Calico resource")
+		return nil, K8sErrorToCalico(err, kvp.Key)
+	}
+	// Success. Update the revision information from the response.
+	kvp.Revision = resOut.GetObjectMeta().GetResourceVersion()
+
+	return kvp, nil
+}
+
+// UpdateStatus updates status section of an existing Custom K8s Resource instance in the k8s API from the supplied KVPair.
+func (c *customK8sResourceClient) UpdateStatus(ctx context.Context, kvp *model.KVPair) (*model.KVPair, error) {
+	logContext := log.WithFields(log.Fields{
+		"Key":             kvp.Key,
+		"Value":           kvp.Value,
+		"Parent Resource": c.resource,
+	})
+	logContext.Debug("UpdateStatus custom Kubernetes resource")
+
+	// Create storage for the updated resource.
+	resOut := reflect.New(c.k8sResourceType).Interface().(Resource)
+
+	var updateError error
+	// Convert the KVPair to a K8s resource.
+	resIn, err := c.convertKVPairToResource(kvp)
+	if err != nil {
+		logContext.WithError(err).Debug("Error updating resource status")
+		return nil, err
+	}
+
+	// Send the update request using the name.
+	name := resIn.GetObjectMeta().GetName()
+	namespace := resIn.GetObjectMeta().GetNamespace()
+	logContext = logContext.WithField("Name", name)
+	logContext.Debug("Update resource status by name")
+	updateError = c.restClient.Put().
+		Resource(c.resource).
+		SubResource("status").
+		NamespaceIfScoped(namespace, c.namespaced).
+		Body(resIn).
+		Name(name).
+		Do(ctx).Into(resOut)
+	if updateError != nil {
+		// Failed to update the resource.
+		logContext.WithError(updateError).Error("Error updating resource status")
+		return nil, K8sErrorToCalico(updateError, kvp.Key)
+	}
+
+	// Update the return data with the metadata populated by the (Kubernetes) datastore.
+	kvp, err = c.convertResourceToKVPair(resOut)
+	if err != nil {
+		logContext.WithError(err).Debug("Error converting returned K8s resource to Calico resource")
 		return nil, K8sErrorToCalico(err, kvp.Key)
 	}
 	// Success. Update the revision information from the response.
@@ -290,55 +342,65 @@ func (c *customK8sResourceClient) List(ctx context.Context, list model.ListInter
 	})
 	logContext.Debug("Received List request")
 
-	// Attempt to convert the ListInterface to a Key.  If possible, the parameters
-	// indicate a fully qualified resource, and we'll need to use Get instead of
-	// List.
-	if key := c.listInterfaceToKey(list); key != nil {
-		logContext.Debug("Performing List using Get")
-		kvps := []*model.KVPair{}
-		if kvp, err := c.Get(ctx, key, revision); err != nil {
-			// The error will already be a Calico error type.  Ignore
-			// error that it doesn't exist - we'll return an empty
-			// list.
-			if _, ok := err.(cerrors.ErrorResourceDoesNotExist); !ok {
-				logContext.WithField("Resource", c.resource).WithError(err).Debug("Error listing resource")
-				return nil, err
-			}
-			return &model.KVPairList{
-				KVPairs:  kvps,
-				Revision: revision,
-			}, nil
-		} else {
-			kvps = append(kvps, kvp)
-			return &model.KVPairList{
-				KVPairs:  kvps,
-				Revision: revision,
-			}, nil
-		}
-	}
-
 	// If it is a namespaced resource, then we'll need the namespace.
-	namespace := list.(model.ResourceListOptions).Namespace
+	resList := list.(model.ResourceListOptions)
+	namespace := resList.Namespace
+	key := c.listInterfaceToKey(list)
 
 	// listFunc performs a list with the given options.
 	listFunc := func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
 		out := reflect.New(c.k8sListType).Interface().(ResourceList)
-		err := c.restClient.Get().
+
+		if key != nil {
+			// Being asked to list a single resource, add the filter.
+			key := key.(model.ResourceKey)
+			name, err := c.keyToName(key)
+			if err != nil {
+				logContext.WithError(err).Error("Failed to convert key to name of resource.")
+				return nil, err
+			}
+			opts.FieldSelector = fmt.Sprintf("metadata.name=%s", name)
+		}
+
+		// Build the request.
+		req := c.restClient.Get().
 			NamespaceIfScoped(namespace, c.namespaced).
 			Resource(c.resource).
-			VersionedParams(&opts, scheme.ParameterCodec).
-			Do(ctx).Into(out)
+			VersionedParams(&opts, scheme.ParameterCodec)
+
+		// If the prefix is specified, look for the resources with the label
+		// of prefix.
+		if resList.Prefix {
+			// The prefix has a trailing "." character, remove it, since it is not valid for k8s labels
+			if !strings.HasSuffix(resList.Name, ".") {
+				return nil, errors.New("internal error: custom resource list invoked for a prefix not in the form '<tier>.'")
+			}
+			name := resList.Name[:len(resList.Name)-1]
+			if name == "default" {
+				req = req.VersionedParams(&metav1.ListOptions{
+					LabelSelector: "!" + apiv3.LabelTier,
+				}, scheme.ParameterCodec)
+			} else {
+				req = req.VersionedParams(&metav1.ListOptions{
+					LabelSelector: apiv3.LabelTier + "=" + name,
+				}, scheme.ParameterCodec)
+			}
+		}
+
+		// Perform the request.
+		err := req.Do(ctx).Into(out)
 		if err != nil {
 			// Don't return errors for "not found".  This just
 			// means there are no matching Custom K8s Resources, and we should return
 			// an empty list.
 			if !kerrors.IsNotFound(err) {
-				logContext.WithError(err).Debug("Error listing resources")
+				log.WithError(err).Debug("Error listing resources")
 				return nil, err
 			}
 		}
 		return out, nil
 	}
+
 	convertFunc := func(r Resource) ([]*model.KVPair, error) {
 		kvp, err := c.convertResourceToKVPair(r)
 		if err != nil {
@@ -349,9 +411,7 @@ func (c *customK8sResourceClient) List(ctx context.Context, list model.ListInter
 	return pagedList(ctx, logContext, revision, list, convertFunc, listFunc)
 }
 
-func (c *customK8sResourceClient) Watch(ctx context.Context, list model.ListInterface, revision string) (api.WatchInterface, error) {
-	// Build watch options to pass to k8s.
-	opts := metav1.ListOptions{ResourceVersion: revision, Watch: true, AllowWatchBookmarks: false}
+func (c *customK8sResourceClient) Watch(ctx context.Context, list model.ListInterface, options api.WatchOptions) (api.WatchInterface, error) {
 	rlo, ok := list.(model.ResourceListOptions)
 	if !ok {
 		return nil, fmt.Errorf("ListInterface is not a ResourceListOptions: %s", list)
@@ -369,7 +429,8 @@ func (c *customK8sResourceClient) Watch(ctx context.Context, list model.ListInte
 	}
 
 	k8sWatchClient := cache.NewListWatchFromClient(c.restClient, c.resource, rlo.Namespace, fieldSelector)
-	k8sWatch, err := k8sWatchClient.WatchFunc(opts)
+	k8sOpts := watchOptionsToK8sListOptions(options)
+	k8sWatch, err := k8sWatchClient.WatchFunc(k8sOpts)
 	if err != nil {
 		return nil, K8sErrorToCalico(err, list)
 	}
@@ -394,7 +455,7 @@ func (c *customK8sResourceClient) listInterfaceToKey(l model.ListInterface) mode
 		key.Namespace = pl.Namespace
 	}
 
-	if pl.Name != "" {
+	if pl.Name != "" && !pl.Prefix {
 		return key
 	}
 	return nil

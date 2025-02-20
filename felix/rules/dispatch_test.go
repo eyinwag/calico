@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2018 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,34 +17,35 @@ package rules_test
 import (
 	"fmt"
 
-	"github.com/projectcalico/calico/felix/generictables"
-	. "github.com/projectcalico/calico/felix/rules"
-
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
 
+	"github.com/projectcalico/calico/felix/generictables"
 	"github.com/projectcalico/calico/felix/ipsets"
 	"github.com/projectcalico/calico/felix/iptables"
 	"github.com/projectcalico/calico/felix/proto"
+	. "github.com/projectcalico/calico/felix/rules"
+	"github.com/projectcalico/calico/felix/types"
 )
 
 var _ = Describe("Dispatch chains", func() {
 	for _, trueOrFalse := range []bool{true, false} {
 		kubeIPVSEnabled := trueOrFalse
 		rrConfigNormal := Config{
-			IPIPEnabled:                 true,
-			IPIPTunnelAddress:           nil,
-			IPSetConfigV4:               ipsets.NewIPVersionConfig(ipsets.IPFamilyV4, "cali", nil, nil),
-			IPSetConfigV6:               ipsets.NewIPVersionConfig(ipsets.IPFamilyV6, "cali", nil, nil),
-			IptablesMarkAccept:          0x8,
-			IptablesMarkPass:            0x10,
-			IptablesMarkScratch0:        0x20,
-			IptablesMarkScratch1:        0x40,
-			IptablesMarkEndpoint:        0xff00,
-			IptablesMarkNonCaliEndpoint: 0x0100,
-			WorkloadIfacePrefixes:       []string{"cali", "tap"},
-			KubeIPVSSupportEnabled:      kubeIPVSEnabled,
+			IPIPEnabled:            true,
+			IPIPTunnelAddress:      nil,
+			IPSetConfigV4:          ipsets.NewIPVersionConfig(ipsets.IPFamilyV4, "cali", nil, nil),
+			IPSetConfigV6:          ipsets.NewIPVersionConfig(ipsets.IPFamilyV6, "cali", nil, nil),
+			MarkAccept:             0x8,
+			MarkPass:               0x10,
+			MarkScratch0:           0x20,
+			MarkScratch1:           0x40,
+			MarkDrop:               0x80,
+			MarkEndpoint:           0xff00,
+			MarkNonCaliEndpoint:    0x0100,
+			WorkloadIfacePrefixes:  []string{"cali", "tap"},
+			KubeIPVSSupportEnabled: kubeIPVSEnabled,
 		}
 
 		expDropRule := generictables.Rule{
@@ -56,8 +57,8 @@ var _ = Describe("Dispatch chains", func() {
 		smNonCaliSetMarkRule := generictables.Rule{
 			Match: iptables.Match(),
 			Action: iptables.SetMaskedMarkAction{
-				Mark: rrConfigNormal.IptablesMarkNonCaliEndpoint,
-				Mask: rrConfigNormal.IptablesMarkEndpoint,
+				Mark: rrConfigNormal.MarkNonCaliEndpoint,
+				Mask: rrConfigNormal.MarkEndpoint,
 			},
 			Comment: []string{"Non-Cali endpoint mark"},
 		}
@@ -66,16 +67,16 @@ var _ = Describe("Dispatch chains", func() {
 		var renderer RuleRenderer
 		BeforeEach(func() {
 			renderer = NewRenderer(rrConfigNormal)
-			epMarkMapper = NewEndpointMarkMapper(rrConfigNormal.IptablesMarkEndpoint, rrConfigNormal.IptablesMarkNonCaliEndpoint)
+			epMarkMapper = NewEndpointMarkMapper(rrConfigNormal.MarkEndpoint, rrConfigNormal.MarkNonCaliEndpoint)
 		})
 
 		It("should panic if interface name is empty", func() {
-			endpointID := proto.WorkloadEndpointID{
+			endpointID := types.WorkloadEndpointID{
 				OrchestratorId: "foobar",
 				WorkloadId:     "workload",
 				EndpointId:     "noname",
 			}
-			input := map[proto.WorkloadEndpointID]*proto.WorkloadEndpoint{
+			input := map[types.WorkloadEndpointID]*proto.WorkloadEndpoint{
 				endpointID: {},
 			}
 			Expect(func() { renderer.WorkloadDispatchChains(input) }).To(Panic())
@@ -83,11 +84,11 @@ var _ = Describe("Dispatch chains", func() {
 
 		DescribeTable("workload rendering tests",
 			func(names []string, expectedChains map[bool][]*generictables.Chain) {
-				var input map[proto.WorkloadEndpointID]*proto.WorkloadEndpoint
+				var input map[types.WorkloadEndpointID]*proto.WorkloadEndpoint
 				if names != nil {
-					input = map[proto.WorkloadEndpointID]*proto.WorkloadEndpoint{}
+					input = map[types.WorkloadEndpointID]*proto.WorkloadEndpoint{}
 					for i, name := range names {
-						id := proto.WorkloadEndpointID{
+						id := types.WorkloadEndpointID{
 							OrchestratorId: "foobar",
 							WorkloadId:     fmt.Sprintf("workload-%v", i),
 							EndpointId:     name,
@@ -102,7 +103,7 @@ var _ = Describe("Dispatch chains", func() {
 				var result []*generictables.Chain
 				if kubeIPVSEnabled {
 					result = append(renderer.WorkloadDispatchChains(input),
-						renderer.EndpointMarkDispatchChains(epMarkMapper, input, map[string]proto.HostEndpointID{})...)
+						renderer.EndpointMarkDispatchChains(epMarkMapper, input, map[string]types.HostEndpointID{})...)
 				} else {
 					result = renderer.WorkloadDispatchChains(input)
 				}
@@ -498,12 +499,12 @@ var _ = Describe("Dispatch chains", func() {
 		)
 
 		Describe("host endpoint rendering tests", func() {
-			convertToInput := func(names []string, expectedChains []*generictables.Chain) map[string]proto.HostEndpointID {
-				var input map[string]proto.HostEndpointID
+			convertToInput := func(names []string, expectedChains []*generictables.Chain) map[string]types.HostEndpointID {
+				var input map[string]types.HostEndpointID
 				if names != nil {
-					input = map[string]proto.HostEndpointID{}
+					input = map[string]types.HostEndpointID{}
 					for _, name := range names {
-						input[name] = proto.HostEndpointID{} // Data is currently ignored.
+						input[name] = types.HostEndpointID{} // Data is currently ignored.
 					}
 				}
 

@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -33,12 +33,15 @@ const (
 	IPAMBlockAttributeNamespace       = "namespace"
 	IPAMBlockAttributeNode            = "node"
 	IPAMBlockAttributeType            = "type"
+	IPAMBlockAttributeService         = "service"
 	IPAMBlockAttributeTypeIPIP        = "ipipTunnelAddress"
 	IPAMBlockAttributeTypeVXLAN       = "vxlanTunnelAddress"
 	IPAMBlockAttributeTypeVXLANV6     = "vxlanV6TunnelAddress"
 	IPAMBlockAttributeTypeWireguard   = "wireguardTunnelAddress"
 	IPAMBlockAttributeTypeWireguardV6 = "wireguardV6TunnelAddress"
 	IPAMBlockAttributeTimestamp       = "timestamp"
+	IPAMAffinityTypeHost              = "host"
+	IPAMAffinityTypeVirtual           = "virtual"
 )
 
 var (
@@ -170,8 +173,21 @@ func (b *AllocationBlock) IsDeleted() bool {
 }
 
 func (b *AllocationBlock) Host() string {
-	if b.Affinity != nil && strings.HasPrefix(*b.Affinity, "host:") {
-		return strings.TrimPrefix(*b.Affinity, "host:")
+	if b.Affinity != nil && strings.HasPrefix(*b.Affinity, fmt.Sprintf("%s:", IPAMAffinityTypeHost)) {
+		return strings.TrimPrefix(*b.Affinity, fmt.Sprintf("%s:", IPAMAffinityTypeHost))
+	}
+	if b.Affinity != nil && strings.HasPrefix(*b.Affinity, fmt.Sprintf("%s:", IPAMAffinityTypeVirtual)) {
+		return strings.TrimPrefix(*b.Affinity, fmt.Sprintf("%s:", IPAMAffinityTypeVirtual))
+	}
+	return ""
+}
+
+func (b *AllocationBlock) AffinityType() string {
+	if b.Affinity != nil && strings.HasPrefix(*b.Affinity, fmt.Sprintf("%s:", IPAMAffinityTypeHost)) {
+		return IPAMAffinityTypeHost
+	}
+	if b.Affinity != nil && strings.HasPrefix(*b.Affinity, fmt.Sprintf("%s:", IPAMAffinityTypeVirtual)) {
+		return IPAMAffinityTypeVirtual
 	}
 	return ""
 }
@@ -216,7 +232,7 @@ func (b *AllocationBlock) NumAddresses() int {
 // Find the ordinal (i.e. how far into the block) a given IP lies.  Returns an error if the IP is outside the block.
 func (b *AllocationBlock) IPToOrdinal(ip net.IP) (int, error) {
 	ipAsInt := net.IPToBigInt(ip)
-	baseInt := net.IPToBigInt(net.IP{b.CIDR.IP})
+	baseInt := net.IPToBigInt(net.IP{IP: b.CIDR.IP})
 	ord := big.NewInt(0).Sub(ipAsInt, baseInt).Int64()
 	if ord < 0 || ord >= int64(b.NumAddresses()) {
 		return 0, fmt.Errorf("IP %s not in block %s", ip, b.CIDR)

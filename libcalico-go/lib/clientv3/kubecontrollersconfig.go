@@ -1,4 +1,4 @@
-// Copyright (c) 2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,9 +19,8 @@ import (
 	"errors"
 	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
 	validator "github.com/projectcalico/calico/libcalico-go/lib/validator/v3"
@@ -52,6 +51,12 @@ func (r kubeControllersConfiguration) fillDefaults(res *apiv3.KubeControllersCon
 	if res.Spec.Controllers.Node != nil {
 		if res.Spec.Controllers.Node.LeakGracePeriod == nil {
 			res.Spec.Controllers.Node.LeakGracePeriod = &metav1.Duration{Duration: 15 * time.Minute}
+		}
+	}
+
+	if res.Spec.Controllers.LoadBalancer != nil {
+		if res.Spec.Controllers.LoadBalancer.AssignIPs == "" {
+			res.Spec.Controllers.LoadBalancer.AssignIPs = apiv3.AllServices
 		}
 	}
 }

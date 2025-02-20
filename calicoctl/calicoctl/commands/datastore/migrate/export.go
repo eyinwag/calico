@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,10 +17,12 @@ package migrate
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/docopt/docopt-go"
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
@@ -28,15 +30,13 @@ import (
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 
-	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
 	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/clientmgr"
 	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/common"
 	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/constants"
 	"github.com/projectcalico/calico/calicoctl/calicoctl/util"
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
+	"github.com/projectcalico/calico/libcalico-go/lib/names"
 )
 
 var title = cases.Title(language.English)
@@ -48,38 +48,41 @@ var title = cases.Title(language.English)
 var allV3Resources []string = []string{
 	"ippools",
 	"bgppeers",
+	"tiers", // Must come before policies since policies reference tiers.
 	"globalnetworkpolicies",
+	"stagedglobalnetworkpolicies",
 	"globalnetworksets",
-	"heps",
-	"kubecontrollersconfigs",
+	"hostendpoints",
+	"kubecontrollersconfigurations",
 	"networkpolicies",
+	"stagednetworkpolicies",
+	"stagedkubernetesnetworkpolicies",
 	"networksets",
-	"nodes",
-	"bgpconfigs",
-	"felixconfigs",
+	"nodes", // Must be before resources that reference nodes.
+	"bgpconfigurations",
+	"felixconfigurations",
 	"ipreservations",
 	"bgpfilters",
 }
 
 var resourceDisplayMap map[string]string = map[string]string{
-	"ipamBlocks":             "IPAMBlocks",
-	"blockaffinities":        "BlockAffinities",
-	"ipamhandles":            "IPAMHandles",
-	"ipamconfigs":            "IPAMConfigurations",
-	"ippools":                "IPPools",
-	"bgpconfigs":             "BGPConfigurations",
-	"bgppeers":               "BGPPeers",
-	"clusterinfos":           "ClusterInformations",
-	"felixconfigs":           "FelixConfigurations",
-	"globalnetworkpolicies":  "GlobalNetworkPolicies",
-	"globalnetworksets":      "GlobalNetworkSets",
-	"heps":                   "HostEndpoints",
-	"kubecontrollersconfigs": "KubeControllersConfigurations",
-	"networkpolicies":        "NetworkPolicies",
-	"networksets":            "Networksets",
-	"nodes":                  "Nodes",
-	"ipreservations":         "IPReservations",
-	"bgpfilters":             "BGPFilters",
+	"ippools":                         "IPPools",
+	"bgpconfigurations":               "BGPConfigurations",
+	"bgppeers":                        "BGPPeers",
+	"felixconfigurations":             "FelixConfigurations",
+	"globalnetworkpolicies":           "GlobalNetworkPolicies",
+	"stagedglobalnetworkpolicies":     "StagedGlobalNetworkPolicies",
+	"globalnetworksets":               "GlobalNetworkSets",
+	"hostendpoints":                   "HostEndpoints",
+	"kubecontrollersconfigurations":   "KubeControllersConfigurations",
+	"networkpolicies":                 "NetworkPolicies",
+	"stagednetworkpolicies":           "StagedNetworkPolicies",
+	"stagedkubernetesnetworkpolicies": "StagedKubernetesNetworkPolicyPolicies",
+	"networksets":                     "NetworkSets",
+	"nodes":                           "Nodes",
+	"ipreservations":                  "IPReservations",
+	"bgpfilters":                      "BGPFilters",
+	"tiers":                           "Tiers",
 }
 
 var namespacedResources map[string]struct{} = map[string]struct{}{
@@ -190,7 +193,7 @@ Description:
 					errStr += "\n"
 				}
 			}
-			return fmt.Errorf(errStr)
+			return errors.New(errStr)
 		}
 
 		for i, resource := range results.Resources {
@@ -221,7 +224,7 @@ Description:
 					if !ok {
 						return fmt.Errorf("Unable to convert Calico network policy for inspection")
 					}
-					if !strings.HasPrefix(metaObj.GetObjectMeta().GetName(), conversion.K8sNetworkPolicyNamePrefix) {
+					if !strings.HasPrefix(metaObj.GetObjectMeta().GetName(), names.K8sNetworkPolicyNamePrefix) {
 						filtered = append(filtered, obj)
 					}
 				}
@@ -229,6 +232,34 @@ Description:
 				err = meta.SetList(resource, filtered)
 				if err != nil {
 					return fmt.Errorf("Unable to remove Kubernetes network policies for export: %s", err)
+				}
+				results.Resources[i] = resource
+			}
+
+			// Skip exporting Kubernetes admin network policies.
+			if r == "globalnetworkpolicies" {
+				objs, err := meta.ExtractList(resource)
+				if err != nil {
+					return fmt.Errorf("Error extracting global network policies for inspection before exporting: %s", err)
+				}
+
+				filtered := []runtime.Object{}
+				for _, obj := range objs {
+					metaObj, ok := obj.(v1.ObjectMetaAccessor)
+					if !ok {
+						return fmt.Errorf("Unable to convert Calico gloabal network policy for inspection")
+					}
+					if strings.HasPrefix(metaObj.GetObjectMeta().GetName(), names.K8sAdminNetworkPolicyNamePrefix) ||
+						strings.HasPrefix(metaObj.GetObjectMeta().GetName(), names.K8sBaselineAdminNetworkPolicyNamePrefix) {
+						continue
+					}
+					filtered = append(filtered, obj)
+
+				}
+
+				err = meta.SetList(resource, filtered)
+				if err != nil {
+					return fmt.Errorf("Unable to remove Kubernetes admin network policies for export: %s", err)
 				}
 				results.Resources[i] = resource
 			}
@@ -264,7 +295,7 @@ Description:
 
 			// Felix configs may also need to be modified if node names do not match the Kubernetes node names.
 			// Felix configs must come after nodes in the allV3Resources list since we populate the node mapping when nodes are exported.
-			if r == "felixconfigs" {
+			if r == "felixconfigurations" {
 				err := meta.EachListItem(resource, func(obj runtime.Object) error {
 					felixConfig, ok := obj.(*apiv3.FelixConfiguration)
 					if !ok {
@@ -290,7 +321,7 @@ Description:
 
 			// BGP configs may also need to be modified if node names do not match the Kubernetes node names.
 			// BGP configs must come after nodes in the allV3Resources list since we populate the node mapping when nodes are exported.
-			if r == "bgpconfigs" {
+			if r == "bgpconfigurations" {
 				err := meta.EachListItem(resource, func(obj runtime.Object) error {
 					bgpConfig, ok := obj.(*apiv3.BGPConfiguration)
 					if !ok {
@@ -354,7 +385,7 @@ Description:
 				errStr += "\n"
 			}
 		}
-		return fmt.Errorf(errStr)
+		return errors.New(errStr)
 	}
 
 	// Denote separation between resources stored in YAML and the JSON IPAM resources.

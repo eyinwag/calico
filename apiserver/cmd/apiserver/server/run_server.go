@@ -1,4 +1,4 @@
-// Copyright (c) 2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2024 Tigera, Inc. All rights reserved.
 
 /*
 Copyright 2017 The Kubernetes Authors.
@@ -19,13 +19,17 @@ limitations under the License.
 package server
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	gpath "path"
 
+	"github.com/sirupsen/logrus"
+	"k8s.io/apiserver/pkg/admission/plugin/policy/validating"
 	genericapiserver "k8s.io/apiserver/pkg/server"
+	"k8s.io/apiserver/pkg/server/options"
 	"k8s.io/klog/v2"
 
 	"github.com/projectcalico/calico/apiserver/pkg/apiserver"
@@ -39,31 +43,53 @@ func PrepareServer(opts *CalicoServerOptions) (*apiserver.ProjectCalicoServer, e
 		opts.StopCh = make(chan struct{})
 	}
 
+	klog.Infof("Enabling ValidatingAdmissionPolicy: %v", opts.EnableValidatingAdmissionPolicy)
+	if !opts.EnableValidatingAdmissionPolicy {
+		opts.RecommendedOptions.Admission = options.NewAdmissionOptions()
+		opts.RecommendedOptions.Admission.DisablePlugins = []string{validating.PluginName}
+	}
 	config, err := opts.Config()
 	if err != nil {
 		return nil, err
 	}
 
-	klog.V(4).Infoln("Completing API server configuration")
+	logrus.Debug("Completing API server configuration")
 	return config.Complete().New()
 }
 
 // RunServer runs the Calico API server.  This blocks until stopped channel (passed in through options) is closed.
 func RunServer(opts *CalicoServerOptions, server *apiserver.ProjectCalicoServer) error {
-	allStop := make(chan struct{})
+	// Create a context rather than using the stop channel - it's a little more versatile.
+	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		klog.Infoln("Starting watch extension")
-		changed, err := WatchExtensionAuth(allStop)
-		if err != nil {
-			klog.Errorln("Unable to watch the extension auth ConfigMap: ", err)
-		}
-		if changed {
-			klog.Infoln("Detected change in extension-apiserver-authentication ConfigMap, exiting so apiserver can be restarted")
+		// Wait for the stop channel and cancel.
+		select {
+		case <-opts.StopCh:
+			cancel()
+		case <-ctx.Done():
 		}
 	}()
 
 	go func() {
-		klog.Infoln("Running the API server")
+		logrus.Info("Starting watch extension")
+		changed, err := WatchExtensionAuth(ctx)
+		if err != nil {
+			logrus.Error("Unable to watch the extension auth ConfigMap: ", err)
+		}
+		if changed {
+			logrus.Debug("Detected change in extension-apiserver-authentication ConfigMap, exiting so apiserver can be restarted")
+			cancel()
+		}
+	}()
+
+	go func() {
+		logrus.Info("Running the API server")
+
+		// Start the Calico resource handler and shared informers and wait for sync before starting other components.
+		server.CalicoResourceLister.Start()
+		server.SharedInformerFactory.Start(ctx.Done())
+		server.CalicoResourceLister.WaitForCacheSync(ctx.Done())
+		server.SharedInformerFactory.WaitForCacheSync(ctx.Done())
 
 		if opts.PrintSwagger {
 			if err := server.GenericAPIServer.AddPostStartHook("swagger-printer",
@@ -73,19 +99,16 @@ func RunServer(opts *CalicoServerOptions, server *apiserver.ProjectCalicoServer)
 					os.Exit(0)
 					return nil
 				}); err != nil {
-				klog.Errorln("failed to add post start hook swagger-printer:", err)
+				logrus.Error("failed to add post start hook swagger-printer:", err)
 			}
 		}
-		if err := server.GenericAPIServer.PrepareRun().Run(allStop); err != nil {
-			klog.Errorln("Error running API server: ", err)
+		if err := server.GenericAPIServer.PrepareRun().RunWithContext(ctx); err != nil {
+			logrus.Error("Error running API server: ", err)
 		}
 	}()
 
-	select {
-	case <-allStop:
-	case <-opts.StopCh:
-		close(allStop)
-	}
+	// Wait until the context is done.
+	<-ctx.Done()
 
 	return nil
 }

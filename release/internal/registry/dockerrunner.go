@@ -1,10 +1,21 @@
+// Copyright (c) 2024 Tigera, Inc. All rights reserved.
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package registry
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
-	"fmt"
 	"io"
 	"os"
 
@@ -96,41 +107,12 @@ func (d *DockerRunner) TagImage(currentTag, newTag string) error {
 	return nil
 }
 
-type errorMessage struct {
-	Error string
-}
-
 // PushImage pushes the image to the registry
 func (d *DockerRunner) PushImage(img string) error {
 	logrus.WithField("image", img).Debug("Pushing image")
-	registryAuth, err := registryAuthStr(ParseImage(img).Registry())
-	if err != nil {
-		logrus.WithError(err).Error("failed to get registry auth")
+	if _, err := command.Run("docker", []string{"push", img}); err != nil {
+		logrus.WithError(err).Error("failed to create manifest list")
 		return err
-	}
-	reader, err := d.dockerClient.ImagePush(context.Background(), img, image.PushOptions{
-		RegistryAuth: registryAuth,
-	})
-	if err != nil {
-		logrus.WithField("image", img).WithError(err).Error("failed to push image")
-		return err
-	}
-	defer reader.Close()
-	var errorMessage errorMessage
-	buffIOReader := bufio.NewReader(reader)
-	for {
-		stream, err := buffIOReader.ReadBytes('\n')
-		if err == io.EOF {
-			break
-		}
-		if err := json.Unmarshal(stream, &errorMessage); err != nil {
-			logrus.WithError(err).Error("failed to unmarshal push response")
-			return err
-		}
-		if errorMessage.Error != "" {
-			logrus.WithField("error", errorMessage).Error("failed to push image")
-			return fmt.Errorf(errorMessage.Error)
-		}
 	}
 	logrus.WithField("image", img).Debug("Image pushed")
 	return nil

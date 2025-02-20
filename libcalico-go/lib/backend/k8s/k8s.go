@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,24 +20,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
-	"sync"
-
-	log "github.com/sirupsen/logrus"
-
-	_ "k8s.io/client-go/plugin/pkg/client/auth" // Import all auth providers.
 
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
-	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
-	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/resources"
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
-	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
-	"github.com/projectcalico/calico/libcalico-go/lib/net"
-	"github.com/projectcalico/calico/libcalico-go/lib/winutils"
-
+	log "github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -45,8 +30,21 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
+	_ "k8s.io/client-go/plugin/pkg/client/auth" // Import all auth providers.
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	adminpolicyclient "sigs.k8s.io/network-policy-api/pkg/client/clientset/versioned/typed/apis/v1alpha1"
+
+	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
+	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/resources"
+	calischeme "github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/scheme"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
+	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
+	"github.com/projectcalico/calico/libcalico-go/lib/net"
+	"github.com/projectcalico/calico/libcalico-go/lib/winutils"
 )
 
 var (
@@ -60,6 +58,9 @@ type KubeClient struct {
 
 	// Client for interacting with CustomResourceDefinition.
 	crdClientV1 *rest.RESTClient
+
+	// Client for interacting with K8S Admin Network Policy, and BaselineAdminNetworkPolicy.
+	k8sAdminPolicyClient *adminpolicyclient.PolicyV1alpha1Client
 
 	disableNodePoll bool
 
@@ -88,9 +89,15 @@ func NewKubeClient(ca *apiconfig.CalicoAPIConfigSpec) (api.Client, error) {
 		return nil, fmt.Errorf("Failed to build V1 CRD client: %v", err)
 	}
 
+	k8sAdminPolicyClient, err := buildK8SAdminPolicyClient(config)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to build K8S Admin Network Policy client: %v", err)
+	}
+
 	kubeClient := &KubeClient{
 		ClientSet:             cs,
 		crdClientV1:           crdClientV1,
+		k8sAdminPolicyClient:  k8sAdminPolicyClient,
 		disableNodePoll:       ca.K8sDisableNodePoll,
 		clientsByResourceKind: make(map[string]resources.K8sResourceClient),
 		clientsByKeyType:      make(map[reflect.Type]resources.K8sResourceClient),
@@ -119,6 +126,24 @@ func NewKubeClient(ca *apiconfig.CalicoAPIConfigSpec) (api.Client, error) {
 	kubeClient.registerResourceClient(
 		reflect.TypeOf(model.ResourceKey{}),
 		reflect.TypeOf(model.ResourceListOptions{}),
+		apiv3.KindStagedGlobalNetworkPolicy,
+		resources.NewStagedGlobalNetworkPolicyClient(cs, crdClientV1),
+	)
+	kubeClient.registerResourceClient(
+		reflect.TypeOf(model.ResourceKey{}),
+		reflect.TypeOf(model.ResourceListOptions{}),
+		model.KindKubernetesAdminNetworkPolicy,
+		resources.NewKubernetesAdminNetworkPolicyClient(k8sAdminPolicyClient),
+	)
+	kubeClient.registerResourceClient(
+		reflect.TypeOf(model.ResourceKey{}),
+		reflect.TypeOf(model.ResourceListOptions{}),
+		model.KindKubernetesBaselineAdminNetworkPolicy,
+		resources.NewKubernetesBaselineAdminNetworkPolicyClient(k8sAdminPolicyClient),
+	)
+	kubeClient.registerResourceClient(
+		reflect.TypeOf(model.ResourceKey{}),
+		reflect.TypeOf(model.ResourceListOptions{}),
 		apiv3.KindGlobalNetworkSet,
 		resources.NewGlobalNetworkSetClient(cs, crdClientV1),
 	)
@@ -131,8 +156,20 @@ func NewKubeClient(ca *apiconfig.CalicoAPIConfigSpec) (api.Client, error) {
 	kubeClient.registerResourceClient(
 		reflect.TypeOf(model.ResourceKey{}),
 		reflect.TypeOf(model.ResourceListOptions{}),
+		apiv3.KindStagedNetworkPolicy,
+		resources.NewStagedNetworkPolicyClient(cs, crdClientV1),
+	)
+	kubeClient.registerResourceClient(
+		reflect.TypeOf(model.ResourceKey{}),
+		reflect.TypeOf(model.ResourceListOptions{}),
 		model.KindKubernetesNetworkPolicy,
 		resources.NewKubernetesNetworkPolicyClient(cs),
+	)
+	kubeClient.registerResourceClient(
+		reflect.TypeOf(model.ResourceKey{}),
+		reflect.TypeOf(model.ResourceListOptions{}),
+		apiv3.KindStagedKubernetesNetworkPolicy,
+		resources.NewStagedKubernetesNetworkPolicyClient(cs, crdClientV1),
 	)
 	kubeClient.registerResourceClient(
 		reflect.TypeOf(model.ResourceKey{}),
@@ -145,6 +182,12 @@ func NewKubeClient(ca *apiconfig.CalicoAPIConfigSpec) (api.Client, error) {
 		reflect.TypeOf(model.ResourceListOptions{}),
 		apiv3.KindNetworkSet,
 		resources.NewNetworkSetClient(cs, crdClientV1),
+	)
+	kubeClient.registerResourceClient(
+		reflect.TypeOf(model.ResourceKey{}),
+		reflect.TypeOf(model.ResourceListOptions{}),
+		apiv3.KindTier,
+		resources.NewTierClient(cs, crdClientV1),
 	)
 	kubeClient.registerResourceClient(
 		reflect.TypeOf(model.ResourceKey{}),
@@ -422,7 +465,11 @@ func (c *KubeClient) Clean() error {
 		apiv3.KindCalicoNodeStatus,
 		apiv3.KindFelixConfiguration,
 		apiv3.KindGlobalNetworkPolicy,
+		apiv3.KindStagedGlobalNetworkPolicy,
 		apiv3.KindNetworkPolicy,
+		apiv3.KindStagedNetworkPolicy,
+		apiv3.KindStagedKubernetesNetworkPolicy,
+		apiv3.KindTier,
 		apiv3.KindGlobalNetworkSet,
 		apiv3.KindNetworkSet,
 		apiv3.KindIPPool,
@@ -491,7 +538,10 @@ func (c *KubeClient) Close() error {
 	return nil
 }
 
-var addToSchemeOnce sync.Once
+// buildK8SAdminPolicyClient builds a RESTClient configured to interact (Baseline) Admin Network Policy.
+func buildK8SAdminPolicyClient(cfg *rest.Config) (*adminpolicyclient.PolicyV1alpha1Client, error) {
+	return adminpolicyclient.NewForConfig(cfg)
+}
 
 // buildCRDClientV1 builds a RESTClient configured to interact with Calico CustomResourceDefinitions
 func buildCRDClientV1(cfg rest.Config) (*rest.RESTClient, error) {
@@ -509,62 +559,8 @@ func buildCRDClientV1(cfg rest.Config) (*rest.RESTClient, error) {
 		return nil, err
 	}
 
-	// We're operating on the pkg level scheme.Scheme, so make sure that multiple
-	// calls to this function don't do this simultaneously, which can cause crashes
-	// due to concurrent access to underlying maps.  For good measure, use a once
-	// since this really only needs to happen one time.
-	addToSchemeOnce.Do(func() {
-		// We also need to register resources.
-		schemeBuilder := runtime.NewSchemeBuilder(
-			func(scheme *runtime.Scheme) error {
-				scheme.AddKnownTypes(
-					*cfg.GroupVersion,
-					&apiv3.FelixConfiguration{},
-					&apiv3.FelixConfigurationList{},
-					&apiv3.IPPool{},
-					&apiv3.IPPoolList{},
-					&apiv3.IPReservation{},
-					&apiv3.IPReservationList{},
-					&apiv3.BGPPeer{},
-					&apiv3.BGPPeerList{},
-					&apiv3.BGPConfiguration{},
-					&apiv3.BGPConfigurationList{},
-					&apiv3.ClusterInformation{},
-					&apiv3.ClusterInformationList{},
-					&apiv3.GlobalNetworkSet{},
-					&apiv3.GlobalNetworkSetList{},
-					&apiv3.GlobalNetworkPolicy{},
-					&apiv3.GlobalNetworkPolicyList{},
-					&apiv3.NetworkPolicy{},
-					&apiv3.NetworkPolicyList{},
-					&apiv3.NetworkSet{},
-					&apiv3.NetworkSetList{},
-					&apiv3.HostEndpoint{},
-					&apiv3.HostEndpointList{},
-					&libapiv3.BlockAffinity{},
-					&libapiv3.BlockAffinityList{},
-					&libapiv3.IPAMBlock{},
-					&libapiv3.IPAMBlockList{},
-					&libapiv3.IPAMHandle{},
-					&libapiv3.IPAMHandleList{},
-					&libapiv3.IPAMConfig{},
-					&libapiv3.IPAMConfigList{},
-					&apiv3.KubeControllersConfiguration{},
-					&apiv3.KubeControllersConfigurationList{},
-					&apiv3.CalicoNodeStatus{},
-					&apiv3.CalicoNodeStatusList{},
-					&apiv3.BGPFilter{},
-					&apiv3.BGPFilterList{},
-				)
-				return nil
-			})
+	calischeme.AddCalicoResourcesToScheme()
 
-		err := schemeBuilder.AddToScheme(scheme.Scheme)
-		if err != nil {
-			log.WithError(err).Fatal("failed to add calico resources to scheme")
-		}
-		metav1.AddToGroupVersion(scheme.Scheme, schema.GroupVersion{Group: "crd.projectcalico.org", Version: "v1"})
-	})
 	return cli, nil
 }
 
@@ -687,9 +683,8 @@ func (c *KubeClient) List(ctx context.Context, l model.ListInterface, revision s
 	return client.List(ctx, l, revision)
 }
 
-// List entries in the datastore.  This may return an empty list if there are
-// no entries matching the request in the ListInterface.
-func (c *KubeClient) Watch(ctx context.Context, l model.ListInterface, revision string) (api.WatchInterface, error) {
+// Watch starts a watch on a particular resource type.
+func (c *KubeClient) Watch(ctx context.Context, l model.ListInterface, options api.WatchOptions) (api.WatchInterface, error) {
 	log.Debugf("Performing 'Watch' for %+v %v", l, reflect.TypeOf(l))
 	client := c.getResourceClientFromList(l)
 	if client == nil {
@@ -699,7 +694,7 @@ func (c *KubeClient) Watch(ctx context.Context, l model.ListInterface, revision 
 			Operation:  "Watch",
 		}
 	}
-	return client.Watch(ctx, l, revision)
+	return client.Watch(ctx, l, options)
 }
 
 func (c *KubeClient) getReadyStatus(ctx context.Context, k model.ReadyFlagKey, revision string) (*model.KVPair, error) {

@@ -19,9 +19,8 @@ import (
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend"
@@ -101,12 +100,13 @@ var _ = testutils.E2eDatastoreDescribe("Tunnel IP allocation syncer tests", test
 			syncTester.ExpectData(model.KVPair{
 				Key: poolKeyV1,
 				Value: &model.IPPool{
-					CIDR:          poolCIDRNet,
-					IPIPInterface: "tunl0",
-					IPIPMode:      encap.CrossSubnet,
-					Masquerade:    true,
-					IPAM:          true,
-					Disabled:      false,
+					CIDR:           poolCIDRNet,
+					IPIPInterface:  "tunl0",
+					IPIPMode:       encap.CrossSubnet,
+					Masquerade:     true,
+					IPAM:           true,
+					Disabled:       false,
+					AssignmentMode: apiv3.Automatic,
 				},
 				Revision: pool.ResourceVersion,
 			})

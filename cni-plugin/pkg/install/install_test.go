@@ -11,7 +11,6 @@ import (
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-
 	log "github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -90,6 +89,7 @@ func runCniContainer(tempDir string, binFolderWriteable bool, extraArgs ...strin
 		"-e", "KUBERNETES_SERVICE_PORT=6443",
 		"-e", "KUBERNETES_NODE_NAME=my-node",
 		"-e", "KUBECONFIG=/home/user/certs/kubeconfig",
+		"-e", "TEST_FILE_PERMISSION=0644",
 		"-v", tempDir + "/bin:" + binFolder,
 		"-v", tempDir + "/net.d:/host/etc/cni/net.d",
 		"-v", tempDir + "/serviceaccount:/var/run/secrets/kubernetes.io/serviceaccount",

@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,17 +21,17 @@ import (
 	"strings"
 	"time"
 
-	log "github.com/sirupsen/logrus"
-
 	"github.com/google/uuid"
-
 	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	log "github.com/sirupsen/logrus"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend"
 	bapi "github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
 	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
+	"github.com/projectcalico/calico/libcalico-go/lib/names"
 	"github.com/projectcalico/calico/libcalico-go/lib/net"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
@@ -89,6 +89,21 @@ func (c client) GlobalNetworkPolicies() GlobalNetworkPolicyInterface {
 	return globalNetworkPolicies{client: c}
 }
 
+// StagedNetworkPolicies returns an interface for managing policy resources.
+func (c client) StagedNetworkPolicies() StagedNetworkPolicyInterface {
+	return stagedNetworkPolicies{client: c}
+}
+
+// StagedGlobalNetworkPolicies returns an interface for managing policy resources.
+func (c client) StagedGlobalNetworkPolicies() StagedGlobalNetworkPolicyInterface {
+	return stagedGlobalNetworkPolicies{client: c}
+}
+
+// StagedKubernetesNetworkPolicies returns an interface for managing policy resources.
+func (c client) StagedKubernetesNetworkPolicies() StagedKubernetesNetworkPolicyInterface {
+	return stagedKubernetesNetworkPolicies{client: c}
+}
+
 // IPPools returns an interface for managing IP pool resources.
 func (c client) IPPools() IPPoolInterface {
 	return ipPools{client: c}
@@ -127,6 +142,11 @@ func (c client) WorkloadEndpoints() WorkloadEndpointInterface {
 // BGPPeers returns an interface for managing BGP peer resources.
 func (c client) BGPPeers() BGPPeerInterface {
 	return bgpPeers{client: c}
+}
+
+// Tiers returns an interface for managing tier resources.
+func (c client) Tiers() TierInterface {
+	return tiers{client: c}
 }
 
 // IPAM returns an interface for managing IP address assignment and releasing.
@@ -220,19 +240,51 @@ func (p poolAccessor) GetAllPools() ([]v3.IPPool, error) {
 
 // EnsureInitialized is used to ensure the backend datastore is correctly
 // initialized for use by Calico.  This method may be called multiple times, and
-// will have no effect if the datastore is already correctly initialized.
+// will have no effect if the datastore is already correctly initialized. This method
+// is fail-slow in that it does as much initialization as it can, only returning error
+// after attempting all initialization steps - this allows partial initialization for
+// components that have restricted access to the Calico resources (mainly a KDD thing).
 //
 // Most Calico deployment scenarios will automatically implicitly invoke this
 // method and so a general consumer of this API can assume that the datastore
 // is already initialized.
 func (c client) EnsureInitialized(ctx context.Context, calicoVersion, clusterType string) error {
+	var errs []error
+
 	// Perform datastore specific initialization first.
 	if err := c.backend.EnsureInitialized(); err != nil {
-		return err
+		log.WithError(err).Info("Unable to initialize backend datastore")
+		errs = append(errs, err)
 	}
 
 	if err := c.ensureClusterInformation(ctx, calicoVersion, clusterType); err != nil {
-		return err
+		log.WithError(err).Info("Unable to initialize ClusterInformation")
+		errs = append(errs, err)
+	}
+
+	err := c.ensureTierExists(ctx, names.DefaultTierName, v3.Deny, v3.DefaultTierOrder)
+	if err != nil {
+		log.WithError(err).Info("Unable to initialize default Tier")
+		errs = append(errs, err)
+	}
+
+	err = c.ensureTierExists(ctx, names.AdminNetworkPolicyTierName, v3.Pass, v3.AdminNetworkPolicyTierOrder)
+	if err != nil {
+		log.WithError(err).Info("Unable to initialize adminnetworkpolicy Tier")
+		errs = append(errs, err)
+	}
+
+	err = c.ensureTierExists(ctx, names.BaselineAdminNetworkPolicyTierName, v3.Pass, v3.BaselineAdminNetworkPolicyTierOrder)
+	if err != nil {
+		log.WithError(err).Info("Unable to initialize baselineadminnetworkpolicy Tier")
+		errs = append(errs, err)
+	}
+
+	// If there are any errors return the first error. We could combine the error text here and return
+	// a generic error, but an application may be expecting a certain error code, so best just return
+	// the original error.
+	if len(errs) > 0 {
+		return errs[0]
 	}
 
 	return nil
@@ -361,6 +413,33 @@ func (c client) ensureClusterInformation(ctx context.Context, calicoVersion, clu
 		break
 	}
 
+	return nil
+}
+
+// ensureTierExists ensures that a desired Tier exits in the datastore.
+// This is done by first trying to get the tier. If it doesn't exist, it
+// is created. A error is returned if there is any error other than when the
+// tier resource already exists, or when creating tiers is not allowed.
+func (c client) ensureTierExists(ctx context.Context, name string, defaultAction v3.Action, order float64) error {
+	tier := v3.NewTier()
+	tier.ObjectMeta = metav1.ObjectMeta{Name: name}
+	tier.Spec = v3.TierSpec{
+		Order:         &order,
+		DefaultAction: &defaultAction,
+	}
+	if _, err := c.Tiers().Create(ctx, tier, options.SetOptions{}); err != nil {
+		switch err.(type) {
+		case cerrors.ErrorResourceAlreadyExists:
+			log.Debugf("Tier %v already exists.", name)
+			return nil
+		case cerrors.ErrorConnectionUnauthorized:
+			log.WithError(err).Warnf("Unauthorized to create tier %v.", name)
+			return nil
+		default:
+			return err
+		}
+	}
+	log.Infof("Tier %v is now available.", name)
 	return nil
 }
 

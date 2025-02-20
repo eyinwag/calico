@@ -1,4 +1,7 @@
 promotions:
+  # Manual promotion for publishing a hashrelease.
+  - name: Publish hashrelease
+    pipeline_file: release/hashrelease.yml
   # Manual promotion for publishing a release.
   - name: Publish official release
     pipeline_file: release/release.yml
@@ -7,6 +10,9 @@ promotions:
     pipeline_file: cleanup.yml
     auto_promote:
       when: "result = 'stopped'"
+  # Rerun failed jobs
+  - name: Rerun failed jobs
+    pipeline_file: rerun_failed_jobs.yml
   # Have separate promotions for publishing images so we can re-run
   # them individually if they fail, and so we can run them in parallel.
   - name: Push apiserver images
@@ -45,12 +51,22 @@ promotions:
     pipeline_file: push-images/typha.yml
     auto_promote:
       when: "branch =~ 'master|release-'"
-
+  - name: Push Goldmane images
+    pipeline_file: push-images/goldmane.yml
+    auto_promote:
+      when: "branch =~ 'master|release-'"
+  - name: Push Whisker images
+    pipeline_file: push-images/whisker.yml
+    auto_promote:
+      when: "branch =~ 'master|release-'"
+  - name: Push Whisker Backend images
+    pipeline_file: push-images/whisker-backend.yml
+    auto_promote:
+      when: "branch =~ 'master|release-'"
   - name: Publish openstack packages
     pipeline_file: push-images/packaging.yaml
     auto_promote:
       when: "branch =~ 'master'"
-
   - name: Run Fossa scans
     pipeline_file: license-scanning/fossa-scan.yml
     auto_promote:

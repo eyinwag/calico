@@ -23,15 +23,12 @@ import (
 	"sync"
 	"time"
 
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-
-	log "github.com/sirupsen/logrus"
-
 	gomegatypes "github.com/onsi/gomega/types"
+	log "github.com/sirupsen/logrus"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 
 	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
@@ -80,6 +77,7 @@ type SyncerTester struct {
 func (st *SyncerTester) OnStatusUpdated(status api.SyncStatus) {
 	defer GinkgoRecover()
 	st.lock.Lock()
+	log.WithField("status", status).Info("OnStatusUpdated")
 	current := st.status
 	st.status = status
 	st.statusChanged = true
@@ -180,7 +178,7 @@ func (st *SyncerTester) ExpectStatusUpdate(status api.SyncStatus, timeout ...tim
 	} else {
 		EventuallyWithOffset(1, cs, timeout[0], "1ms").Should(Equal(status))
 	}
-	ConsistentlyWithOffset(1, cs).Should(Equal(status))
+	ConsistentlyWithOffset(1, cs, "10ms", "1ms").Should(Equal(status))
 
 	log.Infof("Status is at expected status: %s", status)
 
@@ -329,7 +327,7 @@ func (st *SyncerTester) hasUpdates(expectedUpdates []api.Update, checkOrder bool
 	updateAsKey := func(update api.Update) string {
 		path, err := model.KeyToDefaultPath(update.Key)
 		Expect(err).NotTo(HaveOccurred())
-		return fmt.Sprintf("%s;%s", update.UpdateType, path)
+		return fmt.Sprintf("%d;%s", update.UpdateType, path)
 	}
 
 	// removeFromActualUpdatesMap removes the update from the map, and returns an error if not found. It will remove

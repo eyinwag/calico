@@ -15,10 +15,10 @@
 package watchersyncer
 
 import (
-	log "github.com/sirupsen/logrus"
-
 	"context"
 	"sync"
+
+	log "github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
@@ -32,7 +32,7 @@ const (
 // ResourceType groups together the watch and conversion information for a
 // specific resource type.
 type ResourceType struct {
-	// ListInterface specifies the resource type to watch\.
+	// ListInterface specifies the resource type to watch.
 	ListInterface model.ListInterface
 
 	// UpdateProcessor converts the raw KVPairs returned from the datastore into the appropriate

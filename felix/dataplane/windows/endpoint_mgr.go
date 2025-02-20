@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,12 +24,15 @@ import (
 	"strings"
 	"time"
 
+	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/felix/dataplane/windows/hns"
-
 	"github.com/projectcalico/calico/felix/dataplane/windows/policysets"
 	"github.com/projectcalico/calico/felix/proto"
+	"github.com/projectcalico/calico/felix/types"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
+	"github.com/projectcalico/calico/libcalico-go/lib/names"
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
 )
 
@@ -62,9 +65,9 @@ type endpointManager struct {
 	// the policysets dataplane to be used when looking up endpoint policies/profiles.
 	policysetsDataplane policysets.PolicySetsDataplane
 	// pendingWlEpUpdates stores any pending updates to be performed per endpoint.
-	pendingWlEpUpdates map[proto.WorkloadEndpointID]*proto.WorkloadEndpoint
+	pendingWlEpUpdates map[types.WorkloadEndpointID]*proto.WorkloadEndpoint
 	// activeWlEndpoints stores the active/current state that was applied per endpoint
-	activeWlEndpoints map[proto.WorkloadEndpointID]*proto.WorkloadEndpoint
+	activeWlEndpoints map[types.WorkloadEndpointID]*proto.WorkloadEndpoint
 	// addressToEndpointId serves as a hns endpoint id cache. It enables us to lookup the hns
 	// endpoint id for a given endpoint ip address.
 	addressToEndpointId map[string]string
@@ -86,7 +89,9 @@ type hnsInterface interface {
 	HNSListEndpointRequest() ([]hns.HNSEndpoint, error)
 }
 
-func newEndpointManager(hns hnsInterface, policysets policysets.PolicySetsDataplane) *endpointManager {
+func newEndpointManager(hns hnsInterface,
+	policysets policysets.PolicySetsDataplane,
+) *endpointManager {
 	var networkName string
 	if os.Getenv(envNetworkName) != "" {
 		networkName = os.Getenv(envNetworkName)
@@ -115,8 +120,8 @@ func newEndpointManager(hns hnsInterface, policysets policysets.PolicySetsDatapl
 		hnsNetworkRegexp:    networkNameRegexp,
 		policysetsDataplane: policysets,
 		addressToEndpointId: make(map[string]string),
-		activeWlEndpoints:   map[proto.WorkloadEndpointID]*proto.WorkloadEndpoint{},
-		pendingWlEpUpdates:  map[proto.WorkloadEndpointID]*proto.WorkloadEndpoint{},
+		activeWlEndpoints:   map[types.WorkloadEndpointID]*proto.WorkloadEndpoint{},
+		pendingWlEpUpdates:  map[types.WorkloadEndpointID]*proto.WorkloadEndpoint{},
 		pendingIPSetUpdate:  set.New[string](),
 		hostAddrs:           hostIPv4s,
 	}
@@ -136,11 +141,17 @@ func (m *endpointManager) OnUpdate(msg interface{}) {
 	switch msg := msg.(type) {
 	case *proto.WorkloadEndpointUpdate:
 		log.WithField("workloadEndpointId", msg.Id).Info("Processing WorkloadEndpointUpdate")
-		m.pendingWlEpUpdates[*msg.Id] = msg.Endpoint
+		id := types.ProtoToWorkloadEndpointID(msg.GetId())
+		m.pendingWlEpUpdates[id] = msg.Endpoint
 	case *proto.WorkloadEndpointRemove:
 		log.WithField("workloadEndpointId", msg.Id).Info("Processing WorkloadEndpointRemove")
-		m.pendingWlEpUpdates[*msg.Id] = nil
+		id := types.ProtoToWorkloadEndpointID(msg.GetId())
+		m.pendingWlEpUpdates[id] = nil
 	case *proto.ActivePolicyUpdate:
+		if model.PolicyIsStaged(msg.Id.Name) {
+			log.WithField("policyID", msg.Id).Debug("Skipping ActivePolicyUpdate with staged policy")
+			return
+		}
 		log.WithField("policyID", msg.Id).Info("Processing ActivePolicyUpdate")
 		m.ProcessPolicyProfileUpdate(policysets.PolicyNamePrefix + msg.Id.Name)
 	case *proto.ActiveProfileUpdate:
@@ -191,7 +202,10 @@ func (m *endpointManager) RefreshHnsEndpointCache(forceRefresh bool) error {
 		// Some CNI plugins do not clear endpoint properly when a pod has been torn down.
 		// In that case, it is possible Felix sees multiple endpoints with the same IP.
 		// We need to filter out inactive endpoints that do not attach to any container.
-		if len(endpoint.SharedContainers) == 0 {
+		// An endpoint is considered to be active if its state is Attached or AttachedSharing.
+		// Note: Endpoint.State attribute is dependent on HNS v1 api. If hcsshim upgrades to HNS v2
+		// api this will break. We then need to Reach out to Microsoft to facilate the change via HNS.
+		if endpoint.State.String() != "Attached" && endpoint.State.String() != "AttachedSharing" {
 			log.WithFields(log.Fields{
 				"id":   endpoint.Id,
 				"name": endpoint.Name,
@@ -327,9 +341,6 @@ func (m *endpointManager) CompleteDeferredWork() error {
 	var missingEndpoints bool
 	for id, workload := range m.pendingWlEpUpdates {
 		logCxt := log.WithField("id", id)
-
-		var inboundPolicyIds []string
-		var outboundPolicyIds []string
 		var endpointId string
 
 		// A non-nil workload indicates this is a pending add or update operation
@@ -352,23 +363,71 @@ func (m *endpointManager) CompleteDeferredWork() error {
 
 			logCxt.Info("Processing endpoint add/update")
 
-			if len(workload.Tiers) > 0 && len(workload.Tiers[0].IngressPolicies) > 0 {
-				logCxt.Debug("Workload Tier Policies will be applied Inbound")
-				inboundPolicyIds = append(inboundPolicyIds, prependAll(policysets.PolicyNamePrefix, workload.Tiers[0].IngressPolicies)...)
-			} else if len(workload.ProfileIds) > 0 {
-				logCxt.Debug("Profiles will be applied Inbound")
-				inboundPolicyIds = append(inboundPolicyIds, prependAll(policysets.ProfileNamePrefix, workload.ProfileIds)...)
+			// Figure out which tiers apply in the ingress/egress direction.  We skip any tiers that have no policies
+			// that apply to this endpoint.  At this point we're working with policy names only.
+			//
+			// Also note whether the default tier has policies or not. If the
+			// default tier does not have policies in a direction, then a profile should be added for that direction.
+			var defaultTierIngressAppliesToEP bool
+			var defaultTierEgressAppliesToEP bool
+			var ingressRules, egressRules [][]*hns.ACLPolicy
+			for _, t := range workload.Tiers {
+				log.Debugf("windows workload %v, tiers: %v", workload.Name, t.Name)
+				endOfTierDrop := (t.DefaultAction != string(v3.Pass))
+				if len(t.IngressPolicies) > 0 {
+					if t.Name == names.DefaultTierName {
+						defaultTierIngressAppliesToEP = true
+					}
+					policyNames := prependAll(policysets.PolicyNamePrefix, t.IngressPolicies)
+					ingressRules = append(ingressRules, m.policysetsDataplane.GetPolicySetRules(policyNames, true, endOfTierDrop))
+				}
+				if len(t.EgressPolicies) > 0 {
+					if t.Name == names.DefaultTierName {
+						defaultTierEgressAppliesToEP = true
+					}
+					policyNames := prependAll(policysets.PolicyNamePrefix, t.EgressPolicies)
+					egressRules = append(egressRules, m.policysetsDataplane.GetPolicySetRules(policyNames, false, endOfTierDrop))
+				}
+			}
+			log.Debugf("default tier has ingress policies: %v, egress policies: %v", defaultTierIngressAppliesToEP, defaultTierEgressAppliesToEP)
+
+			// If _no_ policies apply at all, then we fall through to the profiles.  Otherwise, there's no way to get
+			// from policies to profiles.
+			if len(ingressRules) == 0 || !defaultTierIngressAppliesToEP {
+				policyNames := prependAll(policysets.ProfileNamePrefix, workload.ProfileIds)
+				ingressRules = append(ingressRules, m.policysetsDataplane.GetPolicySetRules(policyNames, true, true))
 			}
 
-			if len(workload.Tiers) > 0 && len(workload.Tiers[0].EgressPolicies) > 0 {
-				logCxt.Debug("Workload Tier Policies will be applied Outbound")
-				outboundPolicyIds = append(outboundPolicyIds, prependAll(policysets.PolicyNamePrefix, workload.Tiers[0].EgressPolicies)...)
-			} else if len(workload.ProfileIds) > 0 {
-				logCxt.Debug("Profiles will be applied Outbound")
-				outboundPolicyIds = append(outboundPolicyIds, prependAll(policysets.ProfileNamePrefix, workload.ProfileIds)...)
+			if len(egressRules) == 0 || !defaultTierEgressAppliesToEP {
+				policyNames := prependAll(policysets.ProfileNamePrefix, workload.ProfileIds)
+				egressRules = append(egressRules, m.policysetsDataplane.GetPolicySetRules(policyNames, false, true))
 			}
 
-			err := m.applyRules(id, endpointId, inboundPolicyIds, outboundPolicyIds)
+			// Flatten any tiers.
+			flatIngressRules := flattenTiers(ingressRules)
+			flatEgressRules := flattenTiers(egressRules)
+
+			if log.GetLevel() >= log.DebugLevel {
+				for _, rule := range flatIngressRules {
+					log.WithFields(log.Fields{"rule": rule}).Debug("ingress rules after flattening")
+				}
+				for _, rule := range flatEgressRules {
+					log.WithFields(log.Fields{"rule": rule}).Debug("egress rules after flattening")
+				}
+			}
+
+			// Make sure priorities are ascending.
+			rewritePriorities(flatIngressRules, policysets.PolicyRuleMaxPriority)
+			rewritePriorities(flatEgressRules, policysets.PolicyRuleMaxPriority)
+
+			// Finally, add default allow rule with a host-scope to allow traffic through
+			// the host windows firewall. Required by l2bridge network.
+			// We need to add host rules after priority is rewritten because the value of the priority
+			// for a host rule depends on AclNoHostRulePriority feature support.
+			flatIngressRules = append(flatIngressRules, m.policysetsDataplane.NewHostRule(true))
+			flatEgressRules = append(flatEgressRules, m.policysetsDataplane.NewHostRule(false))
+
+			err := m.applyRules(id, endpointId, flatIngressRules, flatEgressRules)
 			if err != nil {
 				// Failed to apply, this will be rescheduled and retried
 				log.WithError(err).Error("Failed to apply rules update")
@@ -435,21 +494,18 @@ func (m *endpointManager) markAllEndpointForRefresh() {
 
 // applyRules gathers all of the rules for the specified policies and sends them to hns
 // as an endpoint policy update (this actually applies the rules to the dataplane).
-func (m *endpointManager) applyRules(workloadId proto.WorkloadEndpointID, endpointId string, inboundPolicyIds []string, outboundPolicyIds []string) error {
+func (m *endpointManager) applyRules(workloadId types.WorkloadEndpointID, endpointId string, inboundRules, outboundRules []*hns.ACLPolicy) error {
 	logCxt := log.WithFields(log.Fields{"id": workloadId, "endpointId": endpointId})
-	logCxt.WithFields(log.Fields{
-		"inboundPolicyIds":  inboundPolicyIds,
-		"outboundPolicyIds": outboundPolicyIds,
-	}).Info("Applying endpoint rules")
+	logCxt.Info("Applying endpoint rules")
 
-	var rules []*hns.ACLPolicy
+	rules := make([]*hns.ACLPolicy, 0, len(inboundRules)+len(outboundRules)+1)
 
 	if nodeToEp := m.nodeToEndpointRule(); nodeToEp != nil {
 		log.WithField("hostAddrs", m.hostAddrs).Debug("Adding node->endpoint allow rule")
 		rules = append(rules, nodeToEp)
 	}
-	rules = append(rules, m.policysetsDataplane.GetPolicySetRules(inboundPolicyIds, true)...)
-	rules = append(rules, m.policysetsDataplane.GetPolicySetRules(outboundPolicyIds, false)...)
+	rules = append(rules, inboundRules...)
+	rules = append(rules, outboundRules...)
 
 	if len(rules) > 0 {
 		if log.GetLevel() >= log.DebugLevel {

@@ -15,16 +15,17 @@
 package workloadapi
 
 import (
+	"context"
 	"fmt"
 	"log"
 
-	"context"
-
 	"github.com/projectcalico/calico/pod2daemon/binder"
-	pb "github.com/projectcalico/calico/pod2daemon/protos/udsver_v1"
+	pb "github.com/projectcalico/calico/pod2daemon/proto"
 )
 
-type WlServer struct{}
+type WlServer struct {
+	pb.UnimplementedVerifyServer
+}
 
 func NewWlAPIServer() pb.VerifyServer {
 	return &WlServer{}

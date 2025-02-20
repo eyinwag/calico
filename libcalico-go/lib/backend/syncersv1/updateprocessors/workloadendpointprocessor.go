@@ -20,9 +20,8 @@ import (
 	"net"
 	"strings"
 
-	log "github.com/sirupsen/logrus"
-
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	log "github.com/sirupsen/logrus"
 
 	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
@@ -180,6 +179,7 @@ func convertWorkloadEndpointV2ToV1Value(val interface{}) (interface{}, error) {
 		GenerateName:               v3res.GenerateName,
 		AllowSpoofedSourcePrefixes: allowedSources,
 		Annotations:                v3res.GetObjectMeta().GetAnnotations(),
+		QoSControls:                v3res.Spec.QoSControls,
 	}
 
 	return v1value, nil

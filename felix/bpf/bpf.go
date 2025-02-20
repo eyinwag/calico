@@ -38,7 +38,8 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/projectcalico/calico/felix/bpf/bpfdefs"
-	"github.com/projectcalico/calico/felix/bpf/hook"
+	"github.com/projectcalico/calico/felix/bpf/libbpf"
+	"github.com/projectcalico/calico/felix/bpf/maps"
 	"github.com/projectcalico/calico/felix/bpf/utils"
 	"github.com/projectcalico/calico/felix/environment"
 	"github.com/projectcalico/calico/felix/labelindex"
@@ -525,7 +526,7 @@ func getMapStructGeneral(mapDesc []string) (*mapInfo, error) {
 		return nil, fmt.Errorf("cannot parse json output: %v\n%s", err, output)
 	}
 	if m.Err != "" {
-		return nil, fmt.Errorf("%s", m.Err)
+		return nil, errors.New(m.Err)
 	}
 	return &m, nil
 }
@@ -1051,7 +1052,7 @@ func (b *BPFLib) GetXDPTag(ifName string) (string, error) {
 		return "", fmt.Errorf("cannot parse json output: %v\n%s", err, output)
 	}
 	if p.Err != "" {
-		return "", fmt.Errorf("%s", p.Err)
+		return "", errors.New(p.Err)
 	}
 
 	return p.Tag, nil
@@ -1141,7 +1142,7 @@ func (b *BPFLib) GetMapsFromXDP(ifName string) ([]int, error) {
 		return nil, fmt.Errorf("cannot parse json output: %v\n%s", err, output)
 	}
 	if p.Err != "" {
-		return nil, fmt.Errorf("%s", p.Err)
+		return nil, errors.New(p.Err)
 	}
 
 	return p.MapIds, nil
@@ -1666,7 +1667,7 @@ func (b *BPFLib) getSockMapID(progID int) (int, error) {
 		return -1, fmt.Errorf("cannot parse json output: %v\n%s", err, output)
 	}
 	if p.Err != "" {
-		return -1, fmt.Errorf("%s", p.Err)
+		return -1, errors.New(p.Err)
 	}
 
 	for _, mapID := range p.MapIds {
@@ -1717,7 +1718,7 @@ func clearSockmap(mapArgs []string) error {
 		}
 
 		if e.Err != "" {
-			return fmt.Errorf("%s", e.Err)
+			return errors.New(e.Err)
 		}
 
 		keyArgs := jsonKeyToArgs(e.NextKey)
@@ -2247,7 +2248,7 @@ func PolicyDebugJSONFileName(iface, polDir string, ipFamily proto.IPVersion) str
 	return path.Join(RuntimePolDir, fmt.Sprintf("%s_%s_v%d.json", iface, polDir, ipFamily))
 }
 
-func MapPinDir(typ int, name, iface string, h hook.Hook) string {
+func MapPinDir() string {
 	PinBaseDir := path.Join(bpfdefs.DefaultBPFfsPath, "tc")
 	subDir := "globals"
 	return path.Join(PinBaseDir, subDir)
@@ -2348,4 +2349,68 @@ func IterPerCpuMapCmdOutput(output []byte, f func(k, v []byte)) error {
 		f(k, v)
 	}
 	return nil
+}
+
+func LoadObject(file string, data libbpf.GlobalData, mapsToBePinned ...string) (*libbpf.Obj, error) {
+	obj, err := libbpf.OpenObject(file)
+	if err != nil {
+		return nil, err
+	}
+
+	success := false
+	defer func() {
+		if !success {
+			err := obj.Close()
+			if err != nil {
+				log.WithError(err).Error("Error closing BPF object.")
+			}
+		}
+	}()
+
+	for m, err := obj.FirstMap(); m != nil && err == nil; m, err = m.NextMap() {
+		// In case of global variables, libbpf creates an internal map <prog_name>.rodata
+		// The values are read only for the BPF programs, but can be set to a value from
+		// userspace before the program is loaded.
+		mapName := m.Name()
+		if m.IsMapInternal() {
+			if strings.HasPrefix(mapName, ".rodata") {
+				continue
+			}
+
+			if err := data.Set(m); err != nil {
+				return nil, fmt.Errorf("failed to configure %s: %w", file, err)
+			}
+			continue
+		}
+
+		if size := maps.Size(mapName); size != 0 {
+			if err := m.SetSize(size); err != nil {
+				return nil, fmt.Errorf("error resizing map %s: %w", mapName, err)
+			}
+		}
+
+		log.Debugf("Pinning map %s k %d v %d", mapName, m.KeySize(), m.ValueSize())
+		pinDir := MapPinDir()
+		// If mapsToBePinned is not specified, pin all the maps.
+		if len(mapsToBePinned) == 0 {
+			if err := m.SetPinPath(path.Join(pinDir, mapName)); err != nil {
+				return nil, fmt.Errorf("error pinning map %s k %d v %d: %w", mapName, m.KeySize(), m.ValueSize(), err)
+			}
+		} else {
+			for _, name := range mapsToBePinned {
+				if mapName == name {
+					if err := m.SetPinPath(path.Join(pinDir, mapName)); err != nil {
+						return nil, fmt.Errorf("error pinning map %s k %d v %d: %w", mapName, m.KeySize(), m.ValueSize(), err)
+					}
+				}
+			}
+		}
+	}
+
+	if err := obj.Load(); err != nil {
+		return nil, fmt.Errorf("error loading program: %w", err)
+	}
+
+	success = true
+	return obj, nil
 }

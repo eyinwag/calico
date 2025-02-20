@@ -1,4 +1,7 @@
-// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
+//go:build !windows
+// +build !windows
+
+// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -69,22 +72,35 @@ func (m *Map) Path() string {
 }
 
 func (m *Map) Iter(f maps.IterCallback) error {
-	m.Lock()
-	defer m.Unlock()
-
 	m.IterCount++
-
 	if m.IterErr != nil {
 		return m.IterErr
 	}
 
-	for kstr, vstr := range m.Contents {
+	// Take a copy so that we don't run into trouble with the callback calling
+	// methods that take locks.
+	contents := m.copyContents()
+	for kstr, vstr := range contents {
 		action := f([]byte(kstr), []byte(vstr))
 		if action == maps.IterDelete {
 			delete(m.Contents, kstr)
 		}
 	}
 	return nil
+}
+
+func (m *Map) Size() int {
+	return m.MapParameters.MaxEntries
+}
+
+func (m *Map) copyContents() map[string]string {
+	m.Lock()
+	defer m.Unlock()
+	contentsCopy := map[string]string{}
+	for k, v := range m.Contents {
+		contentsCopy[k] = v
+	}
+	return contentsCopy
 }
 
 func (m *Map) Update(k, v []byte) error {
@@ -253,6 +269,10 @@ func (*DummyMap) Get(k []byte) ([]byte, error) {
 
 func (*DummyMap) Delete(k []byte) error {
 	return nil
+}
+
+func (*DummyMap) Size() int {
+	return 0
 }
 
 func (*DummyMap) CopyDeltaFromOldMap() error {

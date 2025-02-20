@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2018 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2024 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,10 +15,9 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"sync"
-
-	"context"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 )
@@ -81,6 +80,8 @@ type Client interface {
 	// revision is still current.
 	//
 	// Some keys are hierarchical, and Delete is a recursive operation.
+	// For example, deleting a Tier also deletes all the policies under
+	// that Tier.
 	//
 	// Any objects that were implicitly added by a Create operation should
 	// also be removed when deleting the objects that implicitly created it.
@@ -111,7 +112,7 @@ type Client interface {
 
 	// Watch returns a WatchInterface used for watching a resources matching the
 	// input list options.
-	Watch(ctx context.Context, list model.ListInterface, revision string) (WatchInterface, error)
+	Watch(ctx context.Context, list model.ListInterface, options WatchOptions) (WatchInterface, error)
 
 	// EnsureInitialized ensures that the backend is initialized
 	// any ready to be used.
@@ -122,6 +123,11 @@ type Client interface {
 
 	// Close the client.
 	//Close()
+}
+
+type WatchOptions struct {
+	Revision            string
+	AllowWatchBookmarks bool
 }
 
 type Syncer interface {
@@ -195,6 +201,7 @@ const (
 	WatchModified WatchEventType = "MODIFIED"
 	WatchDeleted  WatchEventType = "DELETED"
 	WatchError    WatchEventType = "ERROR"
+	WatchBookmark WatchEventType = "BOOKMARK"
 )
 
 // Event represents a single event to a watched resource.
@@ -212,6 +219,34 @@ type WatchEvent struct {
 
 	// The error, if EventType is Error.
 	Error error
+}
+
+func (w WatchEvent) String() string {
+	switch w.Type {
+	case WatchAdded:
+		if w.New == nil {
+			break // Malformed event, but still want to be able to print it!
+		}
+		return fmt.Sprintf("Added:%v@%v", w.New.Key, w.New.Revision)
+	case WatchModified:
+		if w.New == nil {
+			break
+		}
+		return fmt.Sprintf("Modified:%v@%v", w.New.Key, w.New.Revision)
+	case WatchDeleted:
+		if w.Old == nil {
+			break
+		}
+		return fmt.Sprintf("Deleted:%v@%v", w.Old.Key, w.Old.Revision)
+	case WatchBookmark:
+		if w.New == nil {
+			break
+		}
+		return fmt.Sprintf("Bookmark:%v", w.New.Revision)
+	case WatchError:
+		return fmt.Sprintf("Error:%v", w.Error)
+	}
+	return fmt.Sprintf("WatchEvent{Type: %s, Old: %v, New: %v, Error: %v}", w.Type, w.Old, w.New, w.Error)
 }
 
 // FakeWatcher is inspired by apimachinery (watch) FakeWatcher

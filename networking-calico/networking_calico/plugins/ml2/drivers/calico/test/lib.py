@@ -42,6 +42,7 @@ sys.modules['neutron.conf.agent'] = m_neutron.conf.agent
 sys.modules['neutron.db'] = m_neutron.db
 sys.modules['neutron.db.models'] = m_neutron.db.models
 sys.modules['neutron.db.models.l3'] = m_neutron.db.models.l3
+sys.modules['neutron.db.qos'] = m_neutron.db.qos
 sys.modules['neutron.openstack'] = m_neutron.openstack
 sys.modules['neutron.openstack.common'] = m_neutron.openstack.common
 sys.modules['neutron.openstack.common.db'] = m_neutron.openstack.common.db
@@ -113,6 +114,22 @@ port3 = {'binding:vif_type': 'tap',
 floating_ports = [{'fixed_port_id': 'DEADBEEF-1234-5678',
                    'fixed_ip_address': '10.65.0.2',
                    'floating_ip_address': '192.168.0.1'}]
+
+network1 = {'id': 'calico-network-id',
+            'name': 'calico-network-name',
+            'status': 'ACTIVE',
+            'admin_state_up': True,
+            'shared': True,
+            'mtu': 9000,
+            'project_id': 'jane3'}
+
+network2 = {'id': 'calico-other-network-id',
+            'name': 'my-first-network',
+            'status': 'ACTIVE',
+            'admin_state_up': True,
+            'shared': True,
+            'mtu': 9000,
+            'project_id': 'jane3'}
 
 
 class EtcdKeyNotFound(Exception):
@@ -211,6 +228,9 @@ class Lib(object):
     # Subnets that the OpenStack database knows about.
     osdb_subnets = []
 
+    # Networks that the OpenStack database knows about.
+    osdb_networks = []
+
     def setUp(self):
         # Announce the current test case.
         _log.info("TEST CASE: %s", self.id())
@@ -236,9 +256,7 @@ class Lib(object):
         self.db = mech_calico.plugin_dir.get_plugin()
         self.db_context = mech_calico.ctx.get_admin_context()
         self.db_context.to_dict.return_value = {}
-        self.db_context.session.query.return_value.filter_by.side_effect = (
-            self.port_query
-        )
+        self.db_context.session.query.side_effect = self.db_query
 
         # Arrange what the DB's get_ports will return.
         self.db.get_ports.side_effect = self.get_ports
@@ -247,6 +265,10 @@ class Lib(object):
         # Arrange DB's get_subnet and get_subnets calls.
         self.db.get_subnet.side_effect = self.get_subnet
         self.db.get_subnets.side_effect = self.get_subnets
+
+        # Arrange DB's get_network and get_networks calls
+        self.db.get_network.side_effect = self.get_network
+        self.db.get_networks.side_effect = self.get_networks
 
         # Arrange what the DB's get_security_groups query will return (the
         # default SG).
@@ -543,6 +565,18 @@ class Lib(object):
             matches = [s for s in self.osdb_subnets]
         return matches
 
+    def get_network(self, context, id):
+        return self.get_networks(context, filters={'id': [id]})[0]
+
+    def get_networks(self, context, filters=None):
+        if filters is None:
+            return self.osdb_networks
+
+        assert list(filters.keys()) == ['id']
+        allowed_ids = set(filters['id'])
+
+        return [p for p in self.osdb_networks if p['id'] in allowed_ids]
+
     def notify_security_group_update(self, id, rules, port, type):
         """Notify a new or changed security group definition."""
         # Prep appropriate responses for next get_security_group and
@@ -575,21 +609,109 @@ class Lib(object):
         return [b for b in self.port_security_group_bindings
                 if b['port_id'] in allowed_ids]
 
-    def port_query(self, **kw):
-        if kw.get('port_id', None):
-            for port in self.osdb_ports:
-                if port['id'] == kw['port_id']:
-                    return port['fixed_ips']
-        elif kw.get('fixed_port_id', None):
-            fips = []
-            for fip in floating_ports:
-                if fip['fixed_port_id'] == kw['fixed_port_id']:
-                    fips.append(fip)
-            return fips
-        else:
-            raise Exception("port_query doesn't know how to handle kw=%r" % kw)
+    def db_query(self, model, **kw):
+        m = mock.MagicMock()
+        if 'IPAllocation' in str(model.name):
+            m.filter_by.side_effect = self.db_query_ip_allocation
+            return m
+        if 'FloatingIP' in str(model.name):
+            m.filter_by.side_effect = self.db_query_floating_ip
+            return m
+        if 'Network' in str(model.name):
+            m.filter_by.side_effect = self.db_query_network
+            return m
+        if 'QosPolicy' in str(model.name):
+            m.filter_by.side_effect = self.db_query_qos_policy
+            return m
+        raise Exception("db_query model=%r kw=%r" % (model, kw))
 
+    def db_query_ip_allocation(self, **kw):
+        # 'port_id' query key for IPAllocations
+        for port in self.osdb_ports:
+            if port['id'] == kw['port_id']:
+                return port['fixed_ips']
+
+    def db_query_floating_ip(self, **kw):
+        fips = []
+        for fip in floating_ports:
+            if fip['fixed_port_id'] == kw['fixed_port_id']:
+                fips.append(fip)
+        return fips
+
+    def db_query_network(self, **kw):
+        # 'id' query key for Networks
+        for network in self.osdb_networks:
+            if network['id'] == kw['id']:
+                network_mock = mock.MagicMock()
+                network_mock.first.return_value = network
+                return network_mock
         return None
+
+    def db_query_qos_policy(self, **kw):
+        policies = {
+            # Example from
+            # https://docs.openstack.org/api-ref/network/v2/index.html#id695.
+            '1': {
+                "project_id": "8d4c70a21fed4aeba121a1a429ba0d04",
+                "tenant_id": "8d4c70a21fed4aeba121a1a429ba0d04",
+                "id": "46ebaec0-0570-43ac-82f6-60d2b03168c4",
+                "is_default": False,
+                "name": "10Mbit",
+                "description": "This policy limits the ports to 10Mbit max.",
+                "revision_number": 3,
+                "created_at": "2018-04-03T21:26:39Z",
+                "updated_at": "2018-04-03T21:26:39Z",
+                "shared": False,
+                "rules": [
+                    {
+                        "id": "5f126d84-551a-4dcf-bb01-0e9c0df0c793",
+                        "qos_policy_id": "46ebaec0-0570-43ac-82f6-60d2b03168c4",
+                        "max_kbps": 10000,
+                        "max_burst_kbps": 0,
+                        "type": "bandwidth_limit"
+                    },
+                    {
+                        "id": "5f126d84-551a-4dcf-bb01-0e9c0df0c794",
+                        "qos_policy_id": "46ebaec0-0570-43ac-82f6-60d2b03168c4",
+                        "dscp_mark": 26,
+                        "type": "dscp_marking"
+                    }
+                ],
+                "tags": ["tag1,tag2"]
+            },
+            # A policy that will set all possible fields.
+            '2': {
+                "id": "2",
+                "rules": [
+                    {
+                        "max_kbps": 1,
+                        "max_burst_kbps": 2,
+                        "direction": "ingress",
+                        "type": "bandwidth_limit"
+                    },
+                    {
+                        "max_kbps": 3,
+                        "max_burst_kbps": 4,
+                        "direction": "egress",
+                        "type": "bandwidth_limit"
+                    },
+                    {
+                        "max_kpps": 5,
+                        "direction": "ingress",
+                        "type": "packet_rate_limit"
+                    },
+                    {
+                        "max_kpps": 6,
+                        "direction": "egress",
+                        "type": "packet_rate_limit"
+                    },
+                ],
+            },
+        }
+
+        m = mock.MagicMock()
+        m.first.return_value = policies.get(kw['id'], None)
+        return m
 
 
 class FixedUUID(object):

@@ -15,21 +15,20 @@
 package calc
 
 import (
+	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/gomega"
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
 	"github.com/projectcalico/calico/felix/config"
 	"github.com/projectcalico/calico/felix/dispatcher"
 	"github.com/projectcalico/calico/felix/proto"
-
+	"github.com/projectcalico/calico/felix/types"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/encap"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	"github.com/projectcalico/calico/libcalico-go/lib/net"
-
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
-	. "github.com/onsi/gomega"
 )
 
 var _ = Describe("EncapsulationCalculator", func() {
@@ -495,7 +494,7 @@ func (e *encapResolverCallbackRecorder) OnServiceAccountUpdate(update *proto.Ser
 	Fail("ServiceAccountUpdate received")
 }
 
-func (e *encapResolverCallbackRecorder) OnServiceAccountRemove(id proto.ServiceAccountID) {
+func (e *encapResolverCallbackRecorder) OnServiceAccountRemove(id types.ServiceAccountID) {
 	Fail("ServiceAccountRemove received")
 }
 
@@ -503,7 +502,7 @@ func (e *encapResolverCallbackRecorder) OnNamespaceUpdate(update *proto.Namespac
 	Fail("NamespaceUpdate received")
 }
 
-func (e *encapResolverCallbackRecorder) OnNamespaceRemove(id proto.NamespaceID) {
+func (e *encapResolverCallbackRecorder) OnNamespaceRemove(id types.NamespaceID) {
 	Fail("NamespaceRemove received")
 }
 

@@ -1,4 +1,4 @@
-// Copyright (c) 2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,6 +29,10 @@ type ErrorDatastoreError struct {
 	Identifier interface{}
 }
 
+func (e ErrorDatastoreError) Unwrap() error {
+	return e.Err
+}
+
 func (e ErrorDatastoreError) Error() string {
 	return e.Err.Error()
 }
@@ -43,7 +47,7 @@ func (e ErrorDatastoreError) Status() metav1.Status {
 		Status:  metav1.StatusFailure,
 		Code:    http.StatusBadRequest,
 		Reason:  metav1.StatusReasonInvalid,
-		Message: fmt.Sprintf(e.Error()),
+		Message: e.Error(),
 		Details: &metav1.StatusDetails{
 			Name: fmt.Sprintf("%v", e.Identifier),
 		},
@@ -59,6 +63,10 @@ type ErrorResourceDoesNotExist struct {
 
 func (e ErrorResourceDoesNotExist) Error() string {
 	return fmt.Sprintf("resource does not exist: %v with error: %v", e.Identifier, e.Err)
+}
+
+func (e ErrorResourceDoesNotExist) Unwrap() error {
+	return e.Err
 }
 
 // Error indicating an operation is not supported.
@@ -83,6 +91,10 @@ type ErrorResourceAlreadyExists struct {
 	Identifier interface{}
 }
 
+func (e ErrorResourceAlreadyExists) Unwrap() error {
+	return e.Err
+}
+
 func (e ErrorResourceAlreadyExists) Error() string {
 	return fmt.Sprintf("resource already exists: %v", e.Identifier)
 }
@@ -90,6 +102,10 @@ func (e ErrorResourceAlreadyExists) Error() string {
 // Error indicating a problem connecting to the backend.
 type ErrorConnectionUnauthorized struct {
 	Err error
+}
+
+func (e ErrorConnectionUnauthorized) Unwrap() error {
+	return e.Err
 }
 
 func (e ErrorConnectionUnauthorized) Error() string {
@@ -149,6 +165,10 @@ func (e ErrorInsufficientIdentifiers) Error() string {
 type ErrorResourceUpdateConflict struct {
 	Err        error
 	Identifier interface{}
+}
+
+func (e ErrorResourceUpdateConflict) Unwrap() error {
+	return e.Err
 }
 
 func (e ErrorResourceUpdateConflict) Error() string {
@@ -228,6 +248,85 @@ func (e ErrorParsingDatastoreEntry) Error() string {
 	return fmt.Sprintf("failed to parse datastore entry key=%s; value=%s: %v", e.RawKey, e.RawValue, e.Err)
 }
 
+type ErrorAdminPolicyConversion struct {
+	PolicyName string
+	Rules      []ErrorAdminPolicyConversionRule
+}
+
+func (e *ErrorAdminPolicyConversion) BadEgressRule(rule any, reason string) {
+	e.Rules = append(e.Rules, ErrorAdminPolicyConversionRule{
+		EgressRule:  rule,
+		IngressRule: nil,
+		Reason:      reason,
+	})
+}
+
+func (e *ErrorAdminPolicyConversion) BadIngressRule(rule any, reason string) {
+	e.Rules = append(e.Rules, ErrorAdminPolicyConversionRule{
+		EgressRule:  nil,
+		IngressRule: rule,
+		Reason:      reason,
+	})
+}
+
+func (e ErrorAdminPolicyConversion) Error() string {
+	s := fmt.Sprintf("policy: %s", e.PolicyName)
+
+	switch {
+	case len(e.Rules) == 0:
+		s += ": unknown policy conversion error"
+	case len(e.Rules) == 1:
+		f := e.Rules[0]
+
+		s += fmt.Sprintf(": error with rule %s", f)
+	default:
+		s += ": error with the following rules:\n"
+		for _, f := range e.Rules {
+			s += fmt.Sprintf("-  %s\n", f)
+		}
+	}
+
+	return s
+}
+
+func (e ErrorAdminPolicyConversion) GetError() error {
+	if len(e.Rules) == 0 {
+		return nil
+	}
+
+	return e
+}
+
+type ErrorAdminPolicyConversionRule struct {
+	EgressRule  any
+	IngressRule any
+	Reason      string
+}
+
+func (e ErrorAdminPolicyConversionRule) String() string {
+	var fieldString string
+
+	switch {
+	case e.EgressRule != nil:
+		fieldString = fmt.Sprintf("%+v", e.EgressRule)
+	case e.IngressRule != nil:
+		fieldString = fmt.Sprintf("%+v", e.IngressRule)
+	default:
+		fieldString = "unknown rule"
+	}
+
+	if e.Reason != "" {
+		fieldString = fmt.Sprintf("%s (%s)", fieldString, e.Reason)
+	}
+
+	return fieldString
+}
+
+type ErrorPolicyConversion struct {
+	PolicyName string
+	Rules      []ErrorPolicyConversionRule
+}
+
 type ErrorPolicyConversionRule struct {
 	EgressRule  *networkingv1.NetworkPolicyEgressRule
 	IngressRule *networkingv1.NetworkPolicyIngressRule
@@ -251,11 +350,6 @@ func (e ErrorPolicyConversionRule) String() string {
 	}
 
 	return fieldString
-}
-
-type ErrorPolicyConversion struct {
-	PolicyName string
-	Rules      []ErrorPolicyConversionRule
 }
 
 func (e *ErrorPolicyConversion) BadEgressRule(rule *networkingv1.NetworkPolicyEgressRule, reason string) {

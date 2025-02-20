@@ -20,15 +20,14 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"reflect"
 	"regexp"
 	"strings"
 	"time"
 
-	"reflect"
-
 	"github.com/docopt/docopt-go"
 	"github.com/olekukonko/tablewriter"
-	"github.com/shirou/gopsutil/process"
+	"github.com/shirou/gopsutil/v4/process"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/calicoctl/calicoctl/util"

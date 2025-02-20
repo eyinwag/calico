@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2018,2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,17 +26,16 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 
-	. "github.com/projectcalico/calico/typha/pkg/daemon"
-	"github.com/projectcalico/calico/typha/pkg/discovery"
-	"github.com/projectcalico/calico/typha/pkg/syncproto"
-
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	bapi "github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
 	fvtests "github.com/projectcalico/calico/typha/fv-tests"
 	"github.com/projectcalico/calico/typha/pkg/config"
+	. "github.com/projectcalico/calico/typha/pkg/daemon"
+	"github.com/projectcalico/calico/typha/pkg/discovery"
 	"github.com/projectcalico/calico/typha/pkg/syncclient"
+	"github.com/projectcalico/calico/typha/pkg/syncproto"
 	"github.com/projectcalico/calico/typha/pkg/syncserver"
 )
 
@@ -288,6 +287,11 @@ func (b *mockDatastore) EnsureInitialized(ctx context.Context, version, clusterT
 	return nil
 }
 
+// Tiers returns an interface for managing tier resources.
+func (b *mockDatastore) Tiers() clientv3.TierInterface {
+	panic("not implemented")
+}
+
 // Nodes returns an interface for managing node resources.
 func (b *mockDatastore) Nodes() clientv3.NodeInterface {
 	panic("not implemented")
@@ -298,13 +302,28 @@ func (b *mockDatastore) GlobalNetworkPolicies() clientv3.GlobalNetworkPolicyInte
 	panic("not implemented")
 }
 
-// GlobalNetworkPolicies returns an interface for managing global network policy resources.
+// StagedGlobalNetworkPolicies returns an interface for managing staged global network policy resources.
+func (b *mockDatastore) StagedGlobalNetworkPolicies() clientv3.StagedGlobalNetworkPolicyInterface {
+	panic("not implemented")
+}
+
+// GlobalNetworkSets returns an interface for managing global network policy resources.
 func (b *mockDatastore) GlobalNetworkSets() clientv3.GlobalNetworkSetInterface {
 	panic("not implemented")
 }
 
 // NetworkPolicies returns an interface for managing namespaced network policy resources.
 func (b *mockDatastore) NetworkPolicies() clientv3.NetworkPolicyInterface {
+	panic("not implemented")
+}
+
+// StagedNetworkPolicies returns an interface for managing staged namespaced network policy resources.
+func (b *mockDatastore) StagedNetworkPolicies() clientv3.StagedNetworkPolicyInterface {
+	panic("not implemented")
+}
+
+// StagedKubernetesNetworkPolicies returns an interface for managing staged kubernetes network policy resources.
+func (b *mockDatastore) StagedKubernetesNetworkPolicies() clientv3.StagedKubernetesNetworkPolicyInterface {
 	panic("not implemented")
 }
 

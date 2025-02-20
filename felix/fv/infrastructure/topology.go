@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,22 +25,27 @@ import (
 
 	"github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	log "github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
+	"github.com/projectcalico/calico/felix/fv/containers"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	"github.com/projectcalico/calico/libcalico-go/lib/errors"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
 	"github.com/projectcalico/calico/libcalico-go/lib/resources"
+)
 
-	"github.com/projectcalico/calico/felix/fv/containers"
+const (
+	FlowLogSourceNone = iota
+	FlowLogSourceFile
+	FlowLogSourceGoldmane
 )
 
 type TopologyOptions struct {
 	FelixLogSeverity        string
 	FelixDebugFilenameRegex string
+	FelixCoreDumpsEnabled   bool
 	EnableIPv6              bool
 	// Temporary flag to implement and test IPv6 in bpf dataplane.
 	// TODO: Remove it when IPv6 implementation in BPF mode is complete.
@@ -54,6 +59,7 @@ type TopologyOptions struct {
 	IPIPEnabled               bool
 	IPIPRoutesEnabled         bool
 	VXLANMode                 api.VXLANMode
+	VXLANStrategy             VXLANStrategy
 	WireguardEnabled          bool
 	WireguardEnabledV6        bool
 	InitialFelixConfiguration *api.FelixConfiguration
@@ -66,7 +72,10 @@ type TopologyOptions struct {
 	UseIPPools                bool
 	IPPoolCIDR                string
 	IPv6PoolCIDR              string
+	IPPoolUsages              []api.IPPoolAllowedUse
+	IPv6PoolUsages            []api.IPPoolAllowedUse
 	NeedNodeIP                bool
+	FlowLogSource             int
 }
 
 // Calico containers created during topology creation.
@@ -97,19 +106,20 @@ func DefaultTopologyOptions() TopologyOptions {
 		felixLogLevel = envLogLevel
 	}
 	return TopologyOptions{
-		FelixLogSeverity:  felixLogLevel,
-		EnableIPv6:        os.Getenv("FELIX_FV_ENABLE_BPF") != "true",
-		BPFEnableIPv6:     false,
-		ExtraEnvVars:      map[string]string{},
-		ExtraVolumes:      map[string]string{},
-		WithTypha:         false,
-		WithFelixTyphaTLS: false,
-		TyphaLogSeverity:  "info",
-		IPIPEnabled:       true,
-		IPIPRoutesEnabled: true,
-		IPPoolCIDR:        DefaultIPPoolCIDR,
-		IPv6PoolCIDR:      DefaultIPv6PoolCIDR,
-		UseIPPools:        true,
+		FelixLogSeverity:      felixLogLevel,
+		FelixCoreDumpsEnabled: true,
+		EnableIPv6:            os.Getenv("FELIX_FV_ENABLE_BPF") != "true",
+		BPFEnableIPv6:         false,
+		ExtraEnvVars:          map[string]string{},
+		ExtraVolumes:          map[string]string{},
+		WithTypha:             false,
+		WithFelixTyphaTLS:     false,
+		TyphaLogSeverity:      "info",
+		IPIPEnabled:           true,
+		IPIPRoutesEnabled:     true,
+		IPPoolCIDR:            DefaultIPPoolCIDR,
+		IPv6PoolCIDR:          DefaultIPv6PoolCIDR,
+		UseIPPools:            true,
 	}
 }
 
@@ -120,7 +130,12 @@ const (
 	DefaultIPv6PoolCIDR = "dead:beef::/64"
 )
 
-func CreateDefaultIPPoolFromOpts(ctx context.Context, client client.Interface, opts TopologyOptions, ipVersion int) (*api.IPPool, error) {
+func CreateDefaultIPPoolFromOpts(
+	ctx context.Context,
+	client client.Interface,
+	opts TopologyOptions,
+	ipVersion int,
+) (*api.IPPool, error) {
 	ipPool := api.NewIPPool()
 
 	switch ipVersion {
@@ -134,9 +149,17 @@ func CreateDefaultIPPoolFromOpts(ctx context.Context, client client.Interface, o
 		} else {
 			ipPool.Spec.IPIPMode = api.IPIPModeNever
 		}
+
+		if len(opts.IPPoolUsages) > 0 {
+			ipPool.Spec.AllowedUses = opts.IPPoolUsages
+		}
 	case 6:
 		ipPool.Name = DefaultIPv6PoolName
 		ipPool.Spec.CIDR = opts.IPv6PoolCIDR
+
+		if len(opts.IPv6PoolUsages) > 0 {
+			ipPool.Spec.AllowedUses = opts.IPv6PoolUsages
+		}
 	default:
 		log.WithField("ipVersion", ipVersion).Panic("Unknown IP version")
 	}
@@ -169,7 +192,10 @@ func StartSingleNodeEtcdTopology(options TopologyOptions) (tc TopologyContainers
 //   - Configures routes between the hosts, giving each host 10.65.x.0/24, where x is the
 //     index in the returned array.  When creating workloads, use IPs from the relevant block.
 //   - Configures the Tunnel IP for each host as 10.65.x.1.
-func StartNNodeEtcdTopology(n int, opts TopologyOptions) (tc TopologyContainers, etcd *containers.Container, client client.Interface, infra DatastoreInfra) {
+func StartNNodeEtcdTopology(
+	n int,
+	opts TopologyOptions,
+) (tc TopologyContainers, etcd *containers.Container, client client.Interface, infra DatastoreInfra) {
 	log.Infof("Starting a %d-node etcd topology.", n)
 
 	eds, err := GetEtcdDatastoreInfra()
@@ -184,7 +210,10 @@ func StartNNodeEtcdTopology(n int, opts TopologyOptions) (tc TopologyContainers,
 
 // StartSingleNodeTopology starts an etcd container and a single Felix container; it initialises
 // the datastore and installs a Node resource for the Felix node.
-func StartSingleNodeTopology(options TopologyOptions, infra DatastoreInfra) (tc TopologyContainers, calicoClient client.Interface) {
+func StartSingleNodeTopology(
+	options TopologyOptions,
+	infra DatastoreInfra,
+) (tc TopologyContainers, calicoClient client.Interface) {
 	tc, calicoClient = StartNNodeTopology(1, options, infra)
 	return
 }
@@ -197,7 +226,11 @@ func StartSingleNodeTopology(options TopologyOptions, infra DatastoreInfra) (tc 
 //   - Configures routes between the hosts, giving each host 10.65.x.0/24, where x is the
 //     index in the returned array.  When creating workloads, use IPs from the relevant block.
 //   - Configures the Tunnel IP for each host as 10.65.x.1.
-func StartNNodeTopology(n int, opts TopologyOptions, infra DatastoreInfra) (tc TopologyContainers, client client.Interface) {
+func StartNNodeTopology(
+	n int,
+	opts TopologyOptions,
+	infra DatastoreInfra,
+) (tc TopologyContainers, client client.Interface) {
 	log.WithField("options", opts).Infof("Starting a %d-node topology", n)
 	success := false
 	var err error
@@ -319,6 +352,7 @@ func StartNNodeTopology(n int, opts TopologyOptions, infra DatastoreInfra) (tc T
 	Expect(err).To(BeNil())
 	_, IPv6CIDR, err := net.ParseCIDR(opts.IPv6PoolCIDR)
 	Expect(err).To(BeNil())
+
 	for i := 0; i < n; i++ {
 		opts.ExtraEnvVars["BPF_LOG_PFX"] = ""
 		felix := tc.Felixes[i]
@@ -343,11 +377,12 @@ func StartNNodeTopology(n int, opts TopologyOptions, infra DatastoreInfra) (tc T
 			expectedIPs = append(expectedIPs, felix.ExpectedIPIPTunnelAddr)
 		}
 		if opts.VXLANMode != api.VXLANModeNever {
-			infra.SetExpectedVXLANTunnelAddr(felix, IPv4CIDR, i, n > 1)
+			ExpectWithOffset(1, opts.VXLANStrategy).ToNot(BeNil(), "VXLANMode is set but VXLANStrategy is nil")
+			infra.SetExpectedVXLANTunnelAddr(felix, opts.VXLANStrategy.TunnelAddress(i))
 			expectedIPs = append(expectedIPs, felix.ExpectedVXLANTunnelAddr)
 			if opts.EnableIPv6 {
 				expectedIPs = append(expectedIPs, felix.IPv6)
-				infra.SetExpectedVXLANV6TunnelAddr(felix, IPv6CIDR, i, n > 1)
+				infra.SetExpectedVXLANV6TunnelAddr(felix, opts.VXLANStrategy.TunnelAddressV6(i))
 				expectedIPs = append(expectedIPs, felix.ExpectedVXLANV6TunnelAddr)
 			}
 		}

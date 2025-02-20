@@ -23,9 +23,8 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
@@ -284,12 +283,16 @@ var _ = testutils.E2eDatastoreDescribe("Node tests (etcdv3)", testutils.Datastor
 					Mask: net.IPMask{255, 255, 255, 0},
 				},
 			}
-			_, _, err = c.IPAM().ClaimAffinity(ctx, affBlock, name1)
+			affinityCfg := ipam.AffinityConfig{
+				AffinityType: ipam.AffinityTypeHost,
+				Host:         name1,
+			}
+			_, _, err = c.IPAM().ClaimAffinity(ctx, affBlock, affinityCfg)
 			Expect(err).NotTo(HaveOccurred())
 
 			handle := "myhandle"
 			err = c.IPAM().AssignIP(ctx, ipam.AssignIPArgs{
-				IP:       cnet.IP{wepIp},
+				IP:       cnet.IP{IP: wepIp},
 				Hostname: name1,
 				HandleID: &handle,
 			})
@@ -395,7 +398,8 @@ var _ = testutils.E2eDatastoreDescribe("Node tests (etcdv3)", testutils.Datastor
 			list, err := be.List(
 				context.Background(),
 				model.BlockAffinityListOptions{
-					Host: name1,
+					Host:         name1,
+					AffinityType: string(ipam.AffinityTypeHost),
 				},
 				"",
 			)

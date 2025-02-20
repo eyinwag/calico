@@ -78,12 +78,6 @@ bin/calicoctl: bin/calicoctl-linux-amd64
 bin/calicoctl-windows-amd64.exe: bin/calicoctl-windows-amd64
 	mv $< $@
 
-gen-crds:
-	$(DOCKER_RUN) \
-	  $(CALICO_BUILD) \
-	  sh -c 'cd /go/src/$(PACKAGE_NAME)/calicoctl/commands/crds && go generate'
-	$(MAKE) go-fmt
-
 ###############################################################################
 # Building the image
 ###############################################################################
@@ -265,16 +259,6 @@ release-build: .release-$(VERSION).created
 	$(MAKE) retag-build-images-with-registries IMAGETAG=$(VERSION) RELEASE=true
 	$(MAKE) retag-build-images-with-registries IMAGETAG=latest RELEASE=true
 	touch $@
-
-## Verifies the release artifacts produces by `make release-build` are correct.
-release-verify: release-prereqs
-	# Check the reported version is correct for each release artifact.
-	if ! docker run $(CALICOCTL_IMAGE):$(VERSION)-$(ARCH) version | grep 'Version:\s*$(VERSION)$$'; then \
-	  echo "Reported version:" `docker run $(CALICOCTL_IMAGE):$(VERSION)-$(ARCH) version` "\nExpected version: $(VERSION)"; \
-	  false; \
-	else \
-	  echo "Version check passed\n"; \
-	fi
 
 ## Pushes a github release and release artifacts produced by `make release-build`.
 release-publish: release-prereqs .release-$(VERSION).published
